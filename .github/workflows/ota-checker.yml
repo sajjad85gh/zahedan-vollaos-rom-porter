@@ -1,0 +1,554 @@
+name: Volla Algiz OTA Checker
+
+on:
+  schedule:
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Download payload-dumper-go
+        run: |
+          curl -sL https://github.com/ssut/payload-dumper-go/releases/latest/download/payload-dumper-go_linux_amd64.tar.gz | tar xz
+          chmod +x payload-dumper-go
+
+      - name: Write OTA checker script
+        run: |
+          cat << 'PYEOF' > check_ota.py
+          #!/usr/bin/env python3
+          """Check Volla OTA server for new stable updates for the Algiz device."""
+
+          import os
+          import re
+          import sys
+          import requests
+          from bs4 import BeautifulSoup
+
+          OTA_BASE_URL = "https://ota.volla.tech/"
+          DEVICE = "algiz"
+          CHANNEL = "stable"
+          STATE_FILE = "last_version.txt"
+
+          UPDATE_PATTERN = re.compile(
+              r'volla-[\d.]+-(\d{8})-' + re.escape(CHANNEL) + r'-' + re.escape(DEVICE) + r'-signed\.zip',
+              re.IGNORECASE
+          )
+
+          def fetch_page(url):
+              try:
+                  resp = requests.get(url, timeout=60, headers={
+                      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                  })
+                  resp.raise_for_status()
+                  return resp
+              except requests.RequestException as e:
+                  print(f"Error fetching {url}: {e}")
+                  return None
+
+          def parse_html(html):
+              soup = BeautifulSoup(html, "html.parser")
+              updates = []
+              for a_tag in soup.find_all("a", href=True):
+                  href = a_tag["href"]
+                  filename = href.split("/")[-1]
+                  match = UPDATE_PATTERN.search(filename)
+                  if match:
+                      date_str = match.group(1)
+                      if href.startswith("http"):
+                          full_url = href
+                      else:
+                          full_url = OTA_BASE_URL.rstrip("/") + "/" + href.lstrip("/")
+                      updates.append((date_str, full_url))
+              return updates
+
+          def parse_json(data):
+              updates = []
+              items = data if isinstance(data, list) else data.get("files", data.get("updates", []))
+              for item in items:
+                  if isinstance(item, dict):
+                      name = item.get("name", item.get("url", item.get("filename", "")))
+                      url = item.get("url", item.get("download_url", name))
+                  else:
+                      name = str(item)
+                      url = name
+                  match = UPDATE_PATTERN.search(name)
+                  if match:
+                      date_str = match.group(1)
+                      if not url.startswith("http"):
+                          url = OTA_BASE_URL.rstrip("/") + "/" + url.lstrip("/")
+                      updates.append((date_str, url))
+              return updates
+
+          def get_available_updates():
+              resp = fetch_page(OTA_BASE_URL)
+              if resp is None:
+                  return []
+              content_type = resp.headers.get("Content-Type", "")
+              if "json" in content_type:
+                  try:
+                      return parse_json(resp.json())
+                  except (ValueError, KeyError):
+                      pass
+              return parse_html(resp.text)
+
+          def get_last_version():
+              if os.path.exists(STATE_FILE):
+                  with open(STATE_FILE, "r") as f:
+                      return f.read().strip()
+              return ""
+
+          def set_output(name, value):
+              github_output = os.environ.get("GITHUB_OUTPUT")
+              if github_output:
+                  with open(github_output, "a") as f:
+                      f.write(f"{name}={value}\n")
+              else:
+                  print(f"::set-output name={name}::{value}")
+
+          def main():
+              print("Checking Volla OTA server for stable Algiz updates...")
+              updates = get_available_updates()
+              if not updates:
+                  print("No stable updates found for Algiz.")
+                  set_output("new_update", "false")
+                  return 0
+
+              updates.sort(key=lambda x: x[0], reverse=True)
+              latest_date, latest_url = updates[0]
+              print(f"Found {len(updates)} stable update(s). Latest: {latest_date}")
+
+              last_version = get_last_version()
+              if last_version and latest_date <= last_version:
+                  print(f"Already processed version {last_version}. No new update.")
+                  set_output("new_update", "false")
+                  return 0
+
+              print(f"New update available: {latest_url}")
+              set_output("new_update", "true")
+              set_output("download_url", latest_url)
+              set_output("version", latest_date)
+
+              with open(STATE_FILE, "w") as f:
+                  f.write(latest_date)
+              return 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+
+      - name: Write super image builder script
+        run: |
+          cat << 'PYEOF' > make_super.py
+          #!/usr/bin/env python3
+          """Build a super.img from extracted OTA partition images using the LP metadata format."""
+
+          import os
+          import struct
+          import sys
+          import zlib
+
+          BLOCK_SIZE = 4096
+          SECTOR_SIZE = 512
+
+          GEOMETRY_MAGIC = 0x51444953
+          GEOMETRY_STRUCT_MAGIC = 0xFF
+          GEOMETRY_STRUCT_VERSION = 1
+
+          HEADER_MAGIC = 0x4C504D48
+          LP_METADATA_MAJOR_VERSION = 10
+          LP_METADATA_MINOR_VERSION = 0
+
+          ATTR_READ_ONLY = 1
+          TARGET_LINEAR = 0
+
+          LP_NAME_MAX_SIZE = 36
+
+          DEVICE_SIZE = 7516192768
+          METADATA_MAX_SIZE = 65536
+          METADATA_SLOT_COUNT = 2
+          GROUP_NAME = "mtk_dynamic_partitions"
+
+          SUPER_PARTITIONS = [
+              "system",
+              "system_ext",
+              "system_dlkm",
+              "vendor",
+              "vendor_dlkm",
+              "product",
+              "odm_dlkm",
+          ]
+
+          GEOMETRY_STRUCT_SIZE = 76
+          HEADER_STRUCT_SIZE = 56
+          PARTITION_ENTRY_SIZE = 52
+          EXTENT_ENTRY_SIZE = 40
+          GROUP_ENTRY_SIZE = 52
+          BLOCK_DEVICE_ENTRY_SIZE = 68
+
+          def align_up(value, alignment):
+              return (value + alignment - 1) // alignment * alignment
+
+          def crc32(data):
+              return zlib.crc32(data) & 0xFFFFFFFF
+
+          def pack_name(name):
+              encoded = name.encode("utf-8")[:LP_NAME_MAX_SIZE - 1]
+              return encoded.ljust(LP_NAME_MAX_SIZE, b"\x00")
+
+          def build_geometry(pt_off, pt_size, et_off, et_size, total_meta):
+              buf = bytearray(GEOMETRY_STRUCT_SIZE)
+              struct.pack_into("<I", buf, 0, GEOMETRY_MAGIC)
+              struct.pack_into("<I", buf, 4, GEOMETRY_STRUCT_SIZE)
+              buf[8] = GEOMETRY_STRUCT_MAGIC
+              buf[9] = GEOMETRY_STRUCT_VERSION
+              buf[10] = 0
+              buf[11] = 0
+              struct.pack_into("<I", buf, 12, METADATA_MAX_SIZE)
+              struct.pack_into("<I", buf, 16, METADATA_SLOT_COUNT)
+              struct.pack_into("<Q", buf, 20, BLOCK_SIZE)
+              struct.pack_into("<Q", buf, 28, 0)
+              struct.pack_into("<Q", buf, 36, total_meta)
+              struct.pack_into("<Q", buf, 44, pt_off)
+              struct.pack_into("<Q", buf, 52, pt_size)
+              struct.pack_into("<Q", buf, 60, et_off)
+              struct.pack_into("<Q", buf, 68, et_size)
+              buf[10] = crc32(bytes(buf)) & 0xFF
+              return bytes(buf).ljust(BLOCK_SIZE, b"\x00")
+
+          def build_metadata(part_entries, ext_entries, grp_entries, bdev_entries):
+              n_p = len(part_entries)
+              n_e = len(ext_entries)
+              n_g = len(grp_entries)
+              n_b = len(bdev_entries)
+
+              p_off = HEADER_STRUCT_SIZE
+              p_size = n_p * PARTITION_ENTRY_SIZE
+              e_off = p_off + p_size
+              e_size = n_e * EXTENT_ENTRY_SIZE
+              g_off = e_off + e_size
+              g_size = n_g * GROUP_ENTRY_SIZE
+              b_off = g_off + g_size
+              b_size = n_b * BLOCK_DEVICE_ENTRY_SIZE
+              t_size = b_off + b_size
+
+              hdr = bytearray(HEADER_STRUCT_SIZE)
+              struct.pack_into("<I", hdr, 0, HEADER_MAGIC)
+              struct.pack_into("<H", hdr, 4, LP_METADATA_MAJOR_VERSION)
+              struct.pack_into("<H", hdr, 6, LP_METADATA_MINOR_VERSION)
+              struct.pack_into("<I", hdr, 8, HEADER_STRUCT_SIZE)
+              struct.pack_into("<I", hdr, 12, 0)
+              struct.pack_into("<I", hdr, 16, t_size)
+              struct.pack_into("<I", hdr, 20, 0)
+              struct.pack_into("<I", hdr, 24, p_off)
+              struct.pack_into("<I", hdr, 28, n_p)
+              struct.pack_into("<I", hdr, 32, e_off)
+              struct.pack_into("<I", hdr, 36, n_e)
+              struct.pack_into("<I", hdr, 40, g_off)
+              struct.pack_into("<I", hdr, 44, n_g)
+              struct.pack_into("<I", hdr, 48, b_off)
+              struct.pack_into("<I", hdr, 52, n_b)
+
+              tables = (b"".join(part_entries) + b"".join(ext_entries)
+                        + b"".join(grp_entries) + b"".join(bdev_entries))
+
+              struct.pack_into("<I", hdr, 20, crc32(tables))
+              struct.pack_into("<I", hdr, 12, crc32(bytes(hdr)))
+
+              meta = bytes(hdr) + tables
+              meta = meta.ljust(METADATA_MAX_SIZE, b"\x00")
+              return meta, p_off, p_size, e_off, e_size
+
+          def build_partition_entry(name, attrs, first_ext, num_ext, grp_idx):
+              buf = bytearray(PARTITION_ENTRY_SIZE)
+              buf[0:LP_NAME_MAX_SIZE] = pack_name(name)
+              struct.pack_into("<I", buf, 36, attrs)
+              struct.pack_into("<I", buf, 40, first_ext)
+              struct.pack_into("<I", buf, 44, num_ext)
+              struct.pack_into("<I", buf, 48, grp_idx)
+              return bytes(buf)
+
+          def build_extent_entry(start_sec, num_sec, tgt_type, tgt_data, tgt_src):
+              buf = bytearray(EXTENT_ENTRY_SIZE)
+              struct.pack_into("<Q", buf, 0, start_sec)
+              struct.pack_into("<Q", buf, 8, num_sec)
+              struct.pack_into("<I", buf, 16, tgt_type)
+              struct.pack_into("<I", buf, 20, 0)
+              struct.pack_into("<Q", buf, 24, tgt_data)
+              struct.pack_into("<Q", buf, 32, tgt_src)
+              return bytes(buf)
+
+          def build_group_entry(name, max_size, flags=0):
+              buf = bytearray(GROUP_ENTRY_SIZE)
+              buf[0:LP_NAME_MAX_SIZE] = pack_name(name)
+              struct.pack_into("<Q", buf, 36, max_size)
+              struct.pack_into("<I", buf, 44, flags)
+              struct.pack_into("<I", buf, 48, 0)
+              return bytes(buf)
+
+          def build_block_device_entry(name, first_sec, align, size):
+              buf = bytearray(BLOCK_DEVICE_ENTRY_SIZE)
+              buf[0:LP_NAME_MAX_SIZE] = pack_name(name)
+              struct.pack_into("<Q", buf, 36, first_sec)
+              struct.pack_into("<Q", buf, 44, align)
+              struct.pack_into("<Q", buf, 52, size)
+              struct.pack_into("<Q", buf, 60, 0)
+              return bytes(buf)
+
+          def find_image(directory, name):
+              for suffix in ["_a", ""]:
+                  path = os.path.join(directory, f"{name}{suffix}.img")
+                  if os.path.isfile(path):
+                      return path
+              return None
+
+          def create_super_image(extracted_dir, output_path):
+              print("Gathering partition images...")
+              part_info = []
+              for name in SUPER_PARTITIONS:
+                  img_path = find_image(extracted_dir, name)
+                  if img_path is None:
+                      print(f"  WARNING: {name} image not found, skipping")
+                      continue
+                  fsize = os.path.getsize(img_path)
+                  asize = align_up(fsize, BLOCK_SIZE)
+                  part_info.append({"name": name, "path": img_path,
+                                    "fsize": fsize, "asize": asize})
+                  print(f"  {name}: {fsize} bytes -> {asize} aligned")
+
+              if not part_info:
+                  print("ERROR: No partition images found!")
+                  return False
+
+              total_meta_area = METADATA_MAX_SIZE * METADATA_SLOT_COUNT + METADATA_MAX_SIZE
+              data_start = align_up(BLOCK_SIZE + total_meta_area, BLOCK_SIZE)
+              total_data = sum(p["asize"] for p in part_info)
+              total_image = data_start + total_data
+
+              print(f"  Metadata area : {total_meta_area} bytes")
+              print(f"  Data start    : {data_start}")
+              print(f"  Total data    : {total_data} bytes")
+              print(f"  Total image   : {total_image} bytes")
+              print(f"  Device size   : {DEVICE_SIZE} bytes")
+
+              if total_image > DEVICE_SIZE:
+                  print(f"ERROR: Image too large! {total_image} > {DEVICE_SIZE}")
+                  return False
+
+              group_max = DEVICE_SIZE - data_start
+
+              p_entries = []
+              for i, p in enumerate(part_info):
+                  p_entries.append(build_partition_entry(
+                      p["name"], ATTR_READ_ONLY, i, 1, 0))
+
+              e_entries = []
+              cur = data_start
+              for p in part_info:
+                  s_sec = cur // SECTOR_SIZE
+                  n_sec = p["asize"] // SECTOR_SIZE
+                  e_entries.append(build_extent_entry(s_sec, n_sec, TARGET_LINEAR, 0, 0))
+                  cur += p["asize"]
+
+              g_entries = [build_group_entry(GROUP_NAME, group_max)]
+              b_entries = [build_block_device_entry(
+                  "super", 0, BLOCK_SIZE // SECTOR_SIZE, DEVICE_SIZE // SECTOR_SIZE)]
+
+              meta, p_off, p_size, e_off, e_size = build_metadata(
+                  p_entries, e_entries, g_entries, b_entries)
+
+              geo = build_geometry(p_off, p_size, e_off, e_size, total_meta_area)
+
+              print(f"Writing {output_path}...")
+              with open(output_path, "wb") as f:
+                  f.write(geo)
+                  for _ in range(METADATA_SLOT_COUNT):
+                      f.write(meta)
+                  f.write(meta)
+                  pos = f.tell()
+                  if pos < data_start:
+                      f.write(b"\x00" * (data_start - pos))
+                  for p in part_info:
+                      with open(p["path"], "rb") as img:
+                          f.write(img.read())
+                      pad = p["asize"] - p["fsize"]
+                      if pad > 0:
+                          f.write(b"\x00" * pad)
+                  pos = f.tell()
+                  if pos < DEVICE_SIZE:
+                      f.write(b"\x00" * (DEVICE_SIZE - pos))
+
+              print(f"Super image created: {output_path} ({os.path.getsize(output_path)} bytes)")
+              return True
+
+          def main():
+              extracted_dir = "extracted"
+              output_path = "super.img"
+              if not os.path.isdir(extracted_dir):
+                  print(f"ERROR: Directory '{extracted_dir}' not found.")
+                  return 1
+              if create_super_image(extracted_dir, output_path):
+                  return 0
+              return 1
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+
+      - name: Check for new stable update
+        id: check
+        run: python check_ota.py
+
+      - name: Download OTA zip
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          echo "Downloading ${{ steps.check.outputs.download_url }} ..."
+          curl -L --retry 3 --retry-delay 10 -o ota.zip "${{ steps.check.outputs.download_url }}"
+          echo "Download size: $(du -h ota.zip | cut -f1)"
+
+      - name: Dump OTA payload
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          mkdir -p extracted
+          ./payload-dumper-go -o extracted ota.zip
+          echo "Extracted files:"
+          ls -lh extracted/
+
+      - name: Free space - remove OTA zip
+        if: steps.check.outputs.new_update == 'true'
+        run: rm -f ota.zip
+
+      - name: Build super image
+        if: steps.check.outputs.new_update == 'true'
+        run: python make_super.py
+
+      - name: Prepare flash package
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          mkdir -p flash_package
+          cp super.img flash_package/
+          MISSING=0
+          for img in boot init_boot vendor_boot dtbo vbmeta vbmeta_system vbmeta_vendor md1img; do
+              FOUND=0
+              for suffix in "" "_a"; do
+                  if [ -f "extracted/${img}${suffix}.img" ]; then
+                      cp "extracted/${img}${suffix}.img" "flash_package/${img}.img"
+                      FOUND=1
+                      echo "Found ${img}${suffix}.img"
+                      break
+                  fi
+              done
+              if [ "$FOUND" = "0" ]; then
+                  echo "WARNING: ${img}.img not found in extracted files"
+                  MISSING=1
+              fi
+          done
+          cat > flash_package/commands.txt << 'CMDEOF'
+          Flash DariaOS 6 then reboot to bootloader;
+          fastboot flash super super.img
+          fastboot --set-active=b
+          fastboot flash boot boot.img
+          fastboot flash init_boot init_boot.img
+          fastboot flash dtbo dtbo.img
+          fastboot flash vendor_boot vendor_boot.img
+          fastboot flash vbmeta vbmeta.img
+          fastboot flash vbmeta_system vbmeta_system.img
+          fastboot flash vbmeta_vendor vbmeta_vendor.img
+          fastboot flash md1img md1img.img
+          fastboot --set-active=a
+          fastboot flash boot boot.img
+          fastboot flash init_boot init_boot.img
+          fastboot flash dtbo dtbo.img
+          fastboot flash vendor_boot vendor_boot.img
+          fastboot flash vbmeta vbmeta.img
+          fastboot flash vbmeta_system vbmeta_system.img
+          fastboot flash vbmeta_vendor vbmeta_vendor.img
+          fastboot flash md1img md1img.img
+          CMDEOF
+          echo "Flash package contents:"
+          ls -lh flash_package/
+          if [ "$MISSING" = "1" ]; then
+              echo ""
+              echo "NOTE: Some images were missing from the OTA payload."
+              echo "The flash package is incomplete. Check the warnings above."
+          fi
+
+      - name: Free space - remove extracted partition images
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          for p in system system_ext system_dlkm vendor vendor_dlkm product odm_dlkm; do
+              rm -f "extracted/${p}.img" "extracted/${p}_a.img"
+          done
+          rm -f extracted/payload.bin
+          echo "Remaining in extracted/:"
+          ls -lh extracted/ 2>/dev/null || echo "(empty or removed)"
+
+      - name: Compress and split for upload
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          cd flash_package
+          echo "Compressing with xz (multi-threaded)..."
+          tar -cf - * | xz -T0 -6 > ../volla-algiz-stable.tar.xz
+          cd ..
+          COMPRESSED_SIZE=$(du -b volla-algiz-stable.tar.xz | cut -f1)
+          echo "Compressed size: $COMPRESSED_SIZE bytes"
+          echo "Splitting into <1900MB parts..."
+          split -b 1900M -d --additional-suffix=.part volla-algiz-stable.tar.xz volla-algiz-stable.
+          rm -f volla-algiz-stable.tar.xz
+          echo "Parts created:"
+          ls -lh volla-algiz-stable.*.part
+
+      - name: Write recombination instructions
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          PART_COUNT=$(ls volla-algiz-stable.*.part | wc -l)
+          cat >> "$GITHUB_STEP_SUMMARY" << MDEOF
+          ## Volla Algiz Stable Update - ${{ steps.check.outputs.version }}
+
+          ### Download
+          Download all parts from the **volla-algiz-stable-${{ steps.check.outputs.version }}** artifact.
+
+          ### Recombine
+          \`\`\`bash
+          cat volla-algiz-stable.*.part > volla-algiz-stable.tar.xz
+          tar -xvf volla-algiz-stable.tar.xz
+          \`\`\`
+
+          ### Flash
+          See \`commands.txt\` inside the archive for fastboot commands.
+          MDEOF
+          echo "Number of parts: $PART_COUNT"
+
+      - name: Upload flash package parts
+        if: steps.check.outputs.new_update == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: volla-algiz-stable-${{ steps.check.outputs.version }}
+          path: volla-algiz-stable.*.part
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Save version state
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_version.txt
+          git commit -m "Update last stable version to ${{ steps.check.outputs.version }}" || true
+          git push

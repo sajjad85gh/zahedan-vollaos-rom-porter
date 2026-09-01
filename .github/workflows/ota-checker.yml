@@ -427,7 +427,7 @@ jobs:
         if: steps.check.outputs.new_update == 'true'
         run: |
           mkdir -p extracted
-          ./payload-dumper-go -o extracted ota.zip
+          "$HOME/go/bin/payload-dumper-go" -o extracted ota.zip
           echo "Extracted files:"
           ls -lh extracted/
 

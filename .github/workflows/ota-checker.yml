@@ -382,9 +382,6 @@ jobs:
                   for _ in range(METADATA_SLOT_COUNT):
                       f.write(meta)
                   f.write(meta)
-                  pos = f.tell()
-                  if pos < data_start:
-                      f.write(b"\x00" * (data_start - pos))
                   for p in part_info:
                       with open(p["path"], "rb") as img:
                           f.write(img.read())
@@ -435,6 +432,12 @@ jobs:
         if: steps.check.outputs.new_update == 'true'
         run: rm -f ota.zip
 
+      - name: Free disk space
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android
+          df -h /
+          
       - name: Build super image
         if: steps.check.outputs.new_update == 'true'
         run: python make_super.py

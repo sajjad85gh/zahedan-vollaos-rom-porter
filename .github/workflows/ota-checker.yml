@@ -518,37 +518,24 @@ jobs:
           echo "Parts created:"
           ls -lh volla-algiz-stable.*.part
 
-      - name: Write recombination instructions
+      - name: Create GitHub Release
         if: steps.check.outputs.new_update == 'true'
-        run: |
-          PART_COUNT=$(ls volla-algiz-stable.*.part | wc -l)
-          cat >> "$GITHUB_STEP_SUMMARY" << MDEOF
-          ## Volla Algiz Stable Update - ${{ steps.check.outputs.version }}
-
-          ### Download
-          Download all parts from the **volla-algiz-stable-${{ steps.check.outputs.version }}** artifact.
-
-          ### Recombine
-          \`\`\`bash
-          cat volla-algiz-stable.*.part > volla-algiz-stable.tar.xz
-          tar -xvf volla-algiz-stable.tar.xz
-          \`\`\`
-
-          ### Flash
-          See \`commands.txt\` inside the archive for fastboot commands.
-          MDEOF
-          echo "Number of parts: $PART_COUNT"
-
-      - name: Upload flash package parts
-        if: steps.check.outputs.new_update == 'true'
-        uses: actions/upload-artifact@v4
+        uses: softprops/action-gh-release@v2
         with:
-          name: volla-algiz-stable-${{ steps.check.outputs.version }}
-          path: volla-algiz-stable.*.part
-          compression-level: 0
-          retention-days: 7
-          if-no-files-found: error
-
+          tag_name: stable-${{ steps.check.outputs.version }}
+          name: "Volla Algiz Stable ${{ steps.check.outputs.version }}"
+          body: |
+            ## Download & Recombine
+            ```bash
+            cat volla-algiz-stable.*.part > volla-algiz-stable.tar.gz
+            tar -xvf volla-algiz-stable.tar.gz
+            ```
+            ## Flash
+            See `commands.txt` inside the archive for fastboot commands.
+          files: volla-algiz-stable.*.part
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          
       - name: Save version state
         if: steps.check.outputs.new_update == 'true'
         run: |

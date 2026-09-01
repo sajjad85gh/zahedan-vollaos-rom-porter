@@ -23,19 +23,10 @@ jobs:
       - name: Install Python dependencies
         run: pip install requests beautifulsoup4
 
-      - name: Download payload-dumper-go
+      - name: Install payload-dumper-go
         run: |
-          cd /tmp
-          ASSET=$(gh release view --repo ssut/payload-dumper-go --json assets -q '.assets[].name' | grep linux_amd64 | head -1)
-          echo "Found asset: $ASSET"
-          gh release download --repo ssut/payload-dumper-go --pattern "$ASSET" --clobber
-          case "$ASSET" in
-            *.tar.gz) tar xzf "$ASSET" ;;
-            *.zip)    unzip -o "$ASSET" ;;
-          esac
-          cp payload-dumper-go "$GITHUB_WORKSPACE/"
-          chmod +x "$GITHUB_WORKSPACE/payload-dumper-go"
-          "$GITHUB_WORKSPACE/payload-dumper-go" --version
+          go install github.com/ssut/payload-dumper-go@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - name: Write OTA checker script
         run: |

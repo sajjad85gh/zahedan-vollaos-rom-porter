@@ -25,7 +25,7 @@ jobs:
 
       - name: Download payload-dumper-go
         run: |
-          curl -sL https://github.com/ssut/payload-dumper-go/releases/latest/download/payload-dumper-go_linux_amd64.tar.gz | tar xz
+          curl -sL https://github.com/ssut/payload-dumper-go/releases/download/v1.3.0/payload-dumper-go_1.3.0_linux_amd64.tar.gz -o pdg.tar.gz && tar xzf pdg.tar.gz && rm -f pdg.tar.gz
           chmod +x payload-dumper-go
 
       - name: Write OTA checker script

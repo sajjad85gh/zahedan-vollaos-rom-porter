@@ -25,8 +25,17 @@ jobs:
 
       - name: Download payload-dumper-go
         run: |
-          curl -sL https://github.com/ssut/payload-dumper-go/releases/download/v1.3.0/payload-dumper-go_1.3.0_linux_amd64.tar.gz -o pdg.tar.gz && tar xzf pdg.tar.gz && rm -f pdg.tar.gz
-          chmod +x payload-dumper-go
+          cd /tmp
+          ASSET=$(gh release view --repo ssut/payload-dumper-go --json assets -q '.assets[].name' | grep linux_amd64 | head -1)
+          echo "Found asset: $ASSET"
+          gh release download --repo ssut/payload-dumper-go --pattern "$ASSET" --clobber
+          case "$ASSET" in
+            *.tar.gz) tar xzf "$ASSET" ;;
+            *.zip)    unzip -o "$ASSET" ;;
+          esac
+          cp payload-dumper-go "$GITHUB_WORKSPACE/"
+          chmod +x "$GITHUB_WORKSPACE/payload-dumper-go"
+          "$GITHUB_WORKSPACE/payload-dumper-go" --version
 
       - name: Write OTA checker script
         run: |

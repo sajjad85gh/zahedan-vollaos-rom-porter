@@ -48,7 +48,7 @@ jobs:
           STATE_FILE = "last_version.txt"
 
           UPDATE_PATTERN = re.compile(
-              r'volla-[\d.]+-(\d{8})-' + re.escape(CHANNEL) + r'-' + re.escape(DEVICE) + r'-signed\.zip',
+              r'volla-([\d.]+)-(\d{8})-' + re.escape(CHANNEL) + r'-' + re.escape(DEVICE) + r'-signed\.zip',
               re.IGNORECASE
           )
 
@@ -71,12 +71,13 @@ jobs:
                   filename = href.split("/")[-1]
                   match = UPDATE_PATTERN.search(filename)
                   if match:
-                      date_str = match.group(1)
+                      version_str = match.group(1)
+                      date_str = match.group(2)
                       if href.startswith("http"):
                           full_url = href
                       else:
                           full_url = OTA_BASE_URL.rstrip("/") + "/" + href.lstrip("/")
-                      updates.append((date_str, full_url))
+                      updates.append((version_str, date_str, full_url))
               return updates
 
           def parse_json(data):
@@ -91,10 +92,11 @@ jobs:
                       url = name
                   match = UPDATE_PATTERN.search(name)
                   if match:
-                      date_str = match.group(1)
+                      version_str = match.group(1)
+                      date_str = match.group(2)
                       if not url.startswith("http"):
                           url = OTA_BASE_URL.rstrip("/") + "/" + url.lstrip("/")
-                      updates.append((date_str, url))
+                      updates.append((version_str, date_str, url))
               return updates
 
           def get_available_updates():
@@ -131,9 +133,9 @@ jobs:
                   set_output("new_update", "false")
                   return 0
 
-              updates.sort(key=lambda x: x[0], reverse=True)
-              latest_date, latest_url = updates[0]
-              print(f"Found {len(updates)} stable update(s). Latest: {latest_date}")
+              updates.sort(key=lambda x: x[1], reverse=True)
+              latest_version, latest_date, latest_url = updates[0]
+              print(f"Found {len(updates)} stable update(s). Latest: v{latest_version} ({latest_date})")
 
               last_version = get_last_version()
               if last_version and latest_date <= last_version:
@@ -144,7 +146,10 @@ jobs:
               print(f"New update available: {latest_url}")
               set_output("new_update", "true")
               set_output("download_url", latest_url)
-              set_output("version", latest_date)
+              set_output("version", latest_version)
+              set_output("version_date", latest_date)
+              set_output("date_formatted", f"{latest_date[:4]}/{latest_date[4:6]}/{latest_date[6:8]}")
+              set_output("android_major", latest_version.split(".")[0])
 
               with open(STATE_FILE, "w") as f:
                   f.write(latest_date)
@@ -437,7 +442,7 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android
           df -h /
-          
+
       - name: Build super image
         if: steps.check.outputs.new_update == 'true'
         run: python make_super.py
@@ -507,14 +512,14 @@ jobs:
         if: steps.check.outputs.new_update == 'true'
         run: |
           cd flash_package
-          echo "Compressing with xz (multi-threaded)..."
-          tar -cf - * | xz -T0 -6 > ../volla-algiz-stable.tar.xz
+          echo "Compressing with zip..."
+          zip -r -6 ../volla-algiz-stable.zip *
           cd ..
-          COMPRESSED_SIZE=$(du -b volla-algiz-stable.tar.xz | cut -f1)
+          COMPRESSED_SIZE=$(du -b volla-algiz-stable.zip | cut -f1)
           echo "Compressed size: $COMPRESSED_SIZE bytes"
           echo "Splitting into <1900MB parts..."
-          split -b 1900M -d --additional-suffix=.part volla-algiz-stable.tar.xz volla-algiz-stable.
-          rm -f volla-algiz-stable.tar.xz
+          split -b 1900M -d --additional-suffix=.part volla-algiz-stable.zip volla-algiz-stable.
+          rm -f volla-algiz-stable.zip
           echo "Parts created:"
           ls -lh volla-algiz-stable.*.part
 
@@ -522,25 +527,96 @@ jobs:
         if: steps.check.outputs.new_update == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: stable-${{ steps.check.outputs.version }}
-          name: "Volla Algiz Stable ${{ steps.check.outputs.version }}"
+          tag_name: stable-${{ steps.check.outputs.version_date }}
+          name: "Volla Algiz Stable ${{ steps.check.outputs.version_date }}"
           body: |
             ## Download & Recombine
             ```bash
-            cat volla-algiz-stable.*.part > volla-algiz-stable.tar.gz
-            tar -xvf volla-algiz-stable.tar.gz
+            cat volla-algiz-stable.*.part > volla-algiz-stable.zip
+            unzip volla-algiz-stable.zip
             ```
             ## Flash
             See `commands.txt` inside the archive for fastboot commands.
           files: volla-algiz-stable.*.part
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          
+
+      - name: Download screenshot image
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          curl -L -o screenshot.png "https://z-cdn-media.chatglm.cn/files/40c1865c-a678-4635-8d1a-e825b6a98a9e.png?auth_key=1888329201-ece16c0436304cbeb954220220bc5d02-0-bcddfa18ea7eab497ac6333cc14dd176"
+          if [ ! -f screenshot.png ] || [ ! -s screenshot.png ]; then
+              echo "WARNING: Failed to download screenshot, will send text-only message"
+              echo "HAS_SCREENSHOT=false" >> "$GITHUB_ENV"
+          else
+              echo "HAS_SCREENSHOT=true" >> "$GITHUB_ENV"
+              echo "Screenshot downloaded: $(du -h screenshot.png | cut -f1)"
+          fi
+
+      - name: Send Telegram notification
+        if: steps.check.outputs.new_update == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          RELEASE_URL="https://github.com/sajjad85gh/zahedan-algiz-port/releases/tag/stable-${{ steps.check.outputs.version_date }}"
+
+          cat > caption.txt << 'CAPEOF'
+          #VollaOS #Rom #Port #Unofficial #U #zahedan
+          VollaOS __VERSION__| Android __ANDROID_MAJOR__.
+          Updated: __DATE__
+
+          • requirement: DariaOS 6 (android 15)
+          • Don't update from settings!
+
+          ×| <a href="__RELEASE_URL__">Download</a>
+          ×| <a href="https://t.me/dariabond_group/166487">Screenshot</a>
+          ×| <a href="https://t.me/dariabond_group/172813">Flash guide</a>
+
+          Bugs:
+          • you tell me
+
+
+          Notes:
+          • Vanilla build
+          • to add udfps screenoff see #udfps_longpress_screenoff note
+          • MicroG included
+          • backup important partitions (see #important_backups note)
+          • Report bug with proper log
+
+          By @Itis_sajjad
+
+          @dariabond_updates | @dariabond_group
+          CAPEOF
+
+          sed -i "s|__VERSION__|${{ steps.check.outputs.version }}|g" caption.txt
+          sed -i "s|__ANDROID_MAJOR__|${{ steps.check.outputs.android_major }}|g" caption.txt
+          sed -i "s|__DATE__|${{ steps.check.outputs.date_formatted }}|g" caption.txt
+          sed -i "s|__RELEASE_URL__|${RELEASE_URL}|g" caption.txt
+
+          if [ "$HAS_SCREENSHOT" = "true" ]; then
+              echo "Sending photo message to Telegram..."
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
+                -F "chat_id=${TELEGRAM_CHAT_ID}" \
+                -F "photo=@screenshot.png" \
+                -F "caption=<caption.txt" \
+                -F "parse_mode=HTML" \
+                -F "disable_web_page_preview=true"
+          else
+              echo "Sending text-only message to Telegram..."
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -F "chat_id=${TELEGRAM_CHAT_ID}" \
+                -F "text=<caption.txt" \
+                -F "parse_mode=HTML" \
+                -F "disable_web_page_preview=true"
+          fi
+          echo "Telegram notification sent."
+
       - name: Save version state
         if: steps.check.outputs.new_update == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add last_version.txt
-          git commit -m "Update last stable version to ${{ steps.check.outputs.version }}" || true
+          git commit -m "Update last stable version to ${{ steps.check.outputs.version_date }}" || true
           git push

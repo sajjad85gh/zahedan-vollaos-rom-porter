@@ -511,17 +511,13 @@ jobs:
       - name: Compress and split for upload
         if: steps.check.outputs.new_update == 'true'
         run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
           cd flash_package
-          echo "Compressing with zip..."
-          zip -r -6 ../volla-algiz-stable.zip *
+          echo "Compressing with 7z multi-volume..."
+          7z a -v1900m -mx=6 ../volla-algiz-stable.7z *
           cd ..
-          COMPRESSED_SIZE=$(du -b volla-algiz-stable.zip | cut -f1)
-          echo "Compressed size: $COMPRESSED_SIZE bytes"
-          echo "Splitting into <1900MB parts..."
-          split -b 1900M -d --additional-suffix=.part volla-algiz-stable.zip volla-algiz-stable.
-          rm -f volla-algiz-stable.zip
           echo "Parts created:"
-          ls -lh volla-algiz-stable.*.part
+          ls -lh volla-algiz-stable.7z.*
 
       - name: Create GitHub Release
         if: steps.check.outputs.new_update == 'true'
@@ -530,14 +526,19 @@ jobs:
           tag_name: stable-${{ steps.check.outputs.version_date }}
           name: "Volla Algiz Stable ${{ steps.check.outputs.version_date }}"
           body: |
-            ## Download & Recombine
+            ## Download & Extract
+            **Linux/Mac:**
             ```bash
-            cat volla-algiz-stable.*.part > volla-algiz-stable.zip
-            unzip volla-algiz-stable.zip
+            7z x volla-algiz-stable.7z.001
             ```
+            **Windows:**
+            Right-click on `volla-algiz-stable.7z.001` → Extract with 7-Zip
+
+            > All parts must be in the same folder. Only extract the `.001` file, the rest are loaded automatically.
+
             ## Flash
-            See `commands.txt` inside the archive for fastboot commands.
-          files: volla-algiz-stable.*.part
+            See `commands.txt` inside the extracted folder for fastboot commands.
+          files: volla-algiz-stable.7z.*
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
@@ -553,44 +554,39 @@ jobs:
               echo "Screenshot downloaded: $(du -h screenshot.png | cut -f1)"
           fi
           
-      - name: Debug Telegram secrets
-        if: steps.check.outputs.new_update == 'true'
-        run: |
-          echo "Chat ID length: ${#TELEGRAM_CHAT_ID}"
-          echo "Chat ID first char: '${TELEGRAM_CHAT_ID:0:1}'"
-          echo "Chat ID last char: '${TELEGRAM_CHAT_ID: -1}'"
-          echo "Bot token length: ${#TELEGRAM_BOT_TOKEN}"
-          
       - name: Send Telegram notification
         if: steps.check.outputs.new_update == 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          RELEASE_URL="https://github.com/sajjad85gh/zahedan-algiz-port/releases/tag/stable-${{ steps.check.outputs.version_date }}"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/stable-${{ steps.check.outputs.version_date }}"
 
           cat > caption.txt << 'CAPEOF'
           #VollaOS #Rom #Port #Unofficial #U #zahedan
-          VollaOS __VERSION__| Android __ANDROID_MAJOR__.
-          Updated: __DATE__
 
-          • requirement: DariaOS 6 (android 15)
-          • Don't update from settings!
+          <b><u>VollaOS __VERSION__ | Android __ANDROID_MAJOR__.</u></b>
+          <b>Updated: __DATE__</b>
+
+          <blockquote>• requirement: DariaOS 6 (android 15)
+          • Don't update from settings!</blockquote>
 
           ×| <a href="__RELEASE_URL__">Download</a>
           ×| <a href="https://t.me/dariabond_group/166487">Screenshot</a>
           ×| <a href="https://t.me/dariabond_group/172813">Flash guide</a>
 
-          Bugs:
+          <b>Bugs:</b>
           • you tell me
 
 
-          Notes:
-          • Vanilla build
+          <b>Notes:</b>
+          <blockquote>• Vanilla build
           • to add udfps screenoff see #udfps_longpress_screenoff note
           • MicroG included
           • backup important partitions (see #important_backups note)
-          • Report bug with proper log
+          • Report bug with proper log</blockquote>
+
+          <blockquote><i>⚠ This ROM is built automatically and may brick your device. Flash at your own risk.</i></blockquote>
 
           By @Itis_sajjad
 

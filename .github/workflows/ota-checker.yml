@@ -552,7 +552,15 @@ jobs:
               echo "HAS_SCREENSHOT=true" >> "$GITHUB_ENV"
               echo "Screenshot downloaded: $(du -h screenshot.png | cut -f1)"
           fi
-
+          
+      - name: Debug Telegram secrets
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          echo "Chat ID length: ${#TELEGRAM_CHAT_ID}"
+          echo "Chat ID first char: '${TELEGRAM_CHAT_ID:0:1}'"
+          echo "Chat ID last char: '${TELEGRAM_CHAT_ID: -1}'"
+          echo "Bot token length: ${#TELEGRAM_BOT_TOKEN}"
+          
       - name: Send Telegram notification
         if: steps.check.outputs.new_update == 'true'
         env:

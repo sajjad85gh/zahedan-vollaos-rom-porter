@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,13 +21,13 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install requests beautifulsoup4
+        run: pip install requests==2.32.3 beautifulsoup4==4.12.3
 
       - name: Install payload-dumper-go
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq liblzma-dev
-          go install github.com/ssut/payload-dumper-go@latest
+          go install github.com/ssut/payload-dumper-go@v0.0.0-20260820001620-05fe59e21c9f
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - name: Write OTA checker script
@@ -159,260 +159,6 @@ jobs:
               sys.exit(main())
           PYEOF
 
-      - name: Write super image builder script
-        run: |
-          cat << 'PYEOF' > make_super.py
-          #!/usr/bin/env python3
-          """Build a super.img from extracted OTA partition images using the LP metadata format."""
-
-          import os
-          import struct
-          import sys
-          import zlib
-
-          BLOCK_SIZE = 4096
-          SECTOR_SIZE = 512
-
-          GEOMETRY_MAGIC = 0x51444953
-          GEOMETRY_STRUCT_MAGIC = 0xFF
-          GEOMETRY_STRUCT_VERSION = 1
-
-          HEADER_MAGIC = 0x4C504D48
-          LP_METADATA_MAJOR_VERSION = 10
-          LP_METADATA_MINOR_VERSION = 0
-
-          ATTR_READ_ONLY = 1
-          TARGET_LINEAR = 0
-
-          LP_NAME_MAX_SIZE = 36
-
-          DEVICE_SIZE = 7516192768
-          METADATA_MAX_SIZE = 65536
-          METADATA_SLOT_COUNT = 2
-          GROUP_NAME = "mtk_dynamic_partitions"
-
-          SUPER_PARTITIONS = [
-              "system",
-              "system_ext",
-              "system_dlkm",
-              "vendor",
-              "vendor_dlkm",
-              "product",
-              "odm_dlkm",
-          ]
-
-          GEOMETRY_STRUCT_SIZE = 76
-          HEADER_STRUCT_SIZE = 56
-          PARTITION_ENTRY_SIZE = 52
-          EXTENT_ENTRY_SIZE = 40
-          GROUP_ENTRY_SIZE = 52
-          BLOCK_DEVICE_ENTRY_SIZE = 68
-
-          def align_up(value, alignment):
-              return (value + alignment - 1) // alignment * alignment
-
-          def crc32(data):
-              return zlib.crc32(data) & 0xFFFFFFFF
-
-          def pack_name(name):
-              encoded = name.encode("utf-8")[:LP_NAME_MAX_SIZE - 1]
-              return encoded.ljust(LP_NAME_MAX_SIZE, b"\x00")
-
-          def build_geometry(pt_off, pt_size, et_off, et_size, total_meta):
-              buf = bytearray(GEOMETRY_STRUCT_SIZE)
-              struct.pack_into("<I", buf, 0, GEOMETRY_MAGIC)
-              struct.pack_into("<I", buf, 4, GEOMETRY_STRUCT_SIZE)
-              buf[8] = GEOMETRY_STRUCT_MAGIC
-              buf[9] = GEOMETRY_STRUCT_VERSION
-              buf[10] = 0
-              buf[11] = 0
-              struct.pack_into("<I", buf, 12, METADATA_MAX_SIZE)
-              struct.pack_into("<I", buf, 16, METADATA_SLOT_COUNT)
-              struct.pack_into("<Q", buf, 20, BLOCK_SIZE)
-              struct.pack_into("<Q", buf, 28, 0)
-              struct.pack_into("<Q", buf, 36, total_meta)
-              struct.pack_into("<Q", buf, 44, pt_off)
-              struct.pack_into("<Q", buf, 52, pt_size)
-              struct.pack_into("<Q", buf, 60, et_off)
-              struct.pack_into("<Q", buf, 68, et_size)
-              buf[10] = crc32(bytes(buf)) & 0xFF
-              return bytes(buf).ljust(BLOCK_SIZE, b"\x00")
-
-          def build_metadata(part_entries, ext_entries, grp_entries, bdev_entries):
-              n_p = len(part_entries)
-              n_e = len(ext_entries)
-              n_g = len(grp_entries)
-              n_b = len(bdev_entries)
-
-              p_off = HEADER_STRUCT_SIZE
-              p_size = n_p * PARTITION_ENTRY_SIZE
-              e_off = p_off + p_size
-              e_size = n_e * EXTENT_ENTRY_SIZE
-              g_off = e_off + e_size
-              g_size = n_g * GROUP_ENTRY_SIZE
-              b_off = g_off + g_size
-              b_size = n_b * BLOCK_DEVICE_ENTRY_SIZE
-              t_size = b_off + b_size
-
-              hdr = bytearray(HEADER_STRUCT_SIZE)
-              struct.pack_into("<I", hdr, 0, HEADER_MAGIC)
-              struct.pack_into("<H", hdr, 4, LP_METADATA_MAJOR_VERSION)
-              struct.pack_into("<H", hdr, 6, LP_METADATA_MINOR_VERSION)
-              struct.pack_into("<I", hdr, 8, HEADER_STRUCT_SIZE)
-              struct.pack_into("<I", hdr, 12, 0)
-              struct.pack_into("<I", hdr, 16, t_size)
-              struct.pack_into("<I", hdr, 20, 0)
-              struct.pack_into("<I", hdr, 24, p_off)
-              struct.pack_into("<I", hdr, 28, n_p)
-              struct.pack_into("<I", hdr, 32, e_off)
-              struct.pack_into("<I", hdr, 36, n_e)
-              struct.pack_into("<I", hdr, 40, g_off)
-              struct.pack_into("<I", hdr, 44, n_g)
-              struct.pack_into("<I", hdr, 48, b_off)
-              struct.pack_into("<I", hdr, 52, n_b)
-
-              tables = (b"".join(part_entries) + b"".join(ext_entries)
-                        + b"".join(grp_entries) + b"".join(bdev_entries))
-
-              struct.pack_into("<I", hdr, 20, crc32(tables))
-              struct.pack_into("<I", hdr, 12, crc32(bytes(hdr)))
-
-              meta = bytes(hdr) + tables
-              meta = meta.ljust(METADATA_MAX_SIZE, b"\x00")
-              return meta, p_off, p_size, e_off, e_size
-
-          def build_partition_entry(name, attrs, first_ext, num_ext, grp_idx):
-              buf = bytearray(PARTITION_ENTRY_SIZE)
-              buf[0:LP_NAME_MAX_SIZE] = pack_name(name)
-              struct.pack_into("<I", buf, 36, attrs)
-              struct.pack_into("<I", buf, 40, first_ext)
-              struct.pack_into("<I", buf, 44, num_ext)
-              struct.pack_into("<I", buf, 48, grp_idx)
-              return bytes(buf)
-
-          def build_extent_entry(start_sec, num_sec, tgt_type, tgt_data, tgt_src):
-              buf = bytearray(EXTENT_ENTRY_SIZE)
-              struct.pack_into("<Q", buf, 0, start_sec)
-              struct.pack_into("<Q", buf, 8, num_sec)
-              struct.pack_into("<I", buf, 16, tgt_type)
-              struct.pack_into("<I", buf, 20, 0)
-              struct.pack_into("<Q", buf, 24, tgt_data)
-              struct.pack_into("<Q", buf, 32, tgt_src)
-              return bytes(buf)
-
-          def build_group_entry(name, max_size, flags=0):
-              buf = bytearray(GROUP_ENTRY_SIZE)
-              buf[0:LP_NAME_MAX_SIZE] = pack_name(name)
-              struct.pack_into("<Q", buf, 36, max_size)
-              struct.pack_into("<I", buf, 44, flags)
-              struct.pack_into("<I", buf, 48, 0)
-              return bytes(buf)
-
-          def build_block_device_entry(name, first_sec, align, size):
-              buf = bytearray(BLOCK_DEVICE_ENTRY_SIZE)
-              buf[0:LP_NAME_MAX_SIZE] = pack_name(name)
-              struct.pack_into("<Q", buf, 36, first_sec)
-              struct.pack_into("<Q", buf, 44, align)
-              struct.pack_into("<Q", buf, 52, size)
-              struct.pack_into("<Q", buf, 60, 0)
-              return bytes(buf)
-
-          def find_image(directory, name):
-              for suffix in ["_a", ""]:
-                  path = os.path.join(directory, f"{name}{suffix}.img")
-                  if os.path.isfile(path):
-                      return path
-              return None
-
-          def create_super_image(extracted_dir, output_path):
-              print("Gathering partition images...")
-              part_info = []
-              for name in SUPER_PARTITIONS:
-                  img_path = find_image(extracted_dir, name)
-                  if img_path is None:
-                      print(f"  WARNING: {name} image not found, skipping")
-                      continue
-                  fsize = os.path.getsize(img_path)
-                  asize = align_up(fsize, BLOCK_SIZE)
-                  part_info.append({"name": name, "path": img_path,
-                                    "fsize": fsize, "asize": asize})
-                  print(f"  {name}: {fsize} bytes -> {asize} aligned")
-
-              if not part_info:
-                  print("ERROR: No partition images found!")
-                  return False
-
-              total_meta_area = METADATA_MAX_SIZE * METADATA_SLOT_COUNT + METADATA_MAX_SIZE
-              data_start = align_up(BLOCK_SIZE + total_meta_area, BLOCK_SIZE)
-              total_data = sum(p["asize"] for p in part_info)
-              total_image = data_start + total_data
-
-              print(f"  Metadata area : {total_meta_area} bytes")
-              print(f"  Data start    : {data_start}")
-              print(f"  Total data    : {total_data} bytes")
-              print(f"  Total image   : {total_image} bytes")
-              print(f"  Device size   : {DEVICE_SIZE} bytes")
-
-              if total_image > DEVICE_SIZE:
-                  print(f"ERROR: Image too large! {total_image} > {DEVICE_SIZE}")
-                  return False
-
-              group_max = DEVICE_SIZE - data_start
-
-              p_entries = []
-              for i, p in enumerate(part_info):
-                  p_entries.append(build_partition_entry(
-                      p["name"], ATTR_READ_ONLY, i, 1, 0))
-
-              e_entries = []
-              cur = data_start
-              for p in part_info:
-                  s_sec = cur // SECTOR_SIZE
-                  n_sec = p["asize"] // SECTOR_SIZE
-                  e_entries.append(build_extent_entry(s_sec, n_sec, TARGET_LINEAR, 0, 0))
-                  cur += p["asize"]
-
-              g_entries = [build_group_entry(GROUP_NAME, group_max)]
-              b_entries = [build_block_device_entry(
-                  "super", 0, BLOCK_SIZE // SECTOR_SIZE, DEVICE_SIZE // SECTOR_SIZE)]
-
-              meta, p_off, p_size, e_off, e_size = build_metadata(
-                  p_entries, e_entries, g_entries, b_entries)
-
-              geo = build_geometry(p_off, p_size, e_off, e_size, total_meta_area)
-
-              print(f"Writing {output_path}...")
-              with open(output_path, "wb") as f:
-                  f.write(geo)
-                  for _ in range(METADATA_SLOT_COUNT):
-                      f.write(meta)
-                  f.write(meta)
-                  for p in part_info:
-                      with open(p["path"], "rb") as img:
-                          f.write(img.read())
-                      pad = p["asize"] - p["fsize"]
-                      if pad > 0:
-                          f.write(b"\x00" * pad)
-                  pos = f.tell()
-                  if pos < DEVICE_SIZE:
-                      f.write(b"\x00" * (DEVICE_SIZE - pos))
-
-              print(f"Super image created: {output_path} ({os.path.getsize(output_path)} bytes)")
-              return True
-
-          def main():
-              extracted_dir = "extracted"
-              output_path = "super.img"
-              if not os.path.isdir(extracted_dir):
-                  print(f"ERROR: Directory '{extracted_dir}' not found.")
-                  return 1
-              if create_super_image(extracted_dir, output_path):
-                  return 0
-              return 1
-
-          if __name__ == "__main__":
-              sys.exit(main())
-          PYEOF
 
       - name: Check for new stable update
         id: check
@@ -442,10 +188,138 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android
           df -h /
+          
+      - name: Install Android Image Tools dependencies
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          set -e
+          export TERM=xterm-256color
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            android-sdk-libsparse-utils \
+            build-essential \
+            automake \
+            autoconf \
+            libtool \
+            pkg-config \
+            git \
+            fuse3 \
+            e2fsprogs \
+            pv \
+            liblz4-dev \
+            uuid-dev \
+            libfuse3-dev \
+            f2fs-tools \
+            fuse2fs \
+            attr \
+            zlib1g-dev \
+            rsync
+          if ! command -v mkfs.erofs >/dev/null || ! command -v erofsfuse >/dev/null; then
+            git clone --depth 1 https://github.com/erofs/erofs-utils.git /tmp/erofs-utils
+            cd /tmp/erofs-utils
+            ./autogen.sh
+            ./configure --enable-fuse
+            make -j"$(nproc)"
+            sudo make install
+            sudo ldconfig
+            cd -
+            rm -rf /tmp/erofs-utils
+          fi
+
+      - name: Clone Android Image Tools
+        if: steps.check.outputs.new_update == 'true'
+        run: git clone --branch v4 --depth 1 https://github.com/ravindu644/Android_Image_Tools.git
+
+      - name: Add my name to settings and remove stock Updater
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          set -e
+          export TERM=xterm-256color
+          AIT="Android_Image_Tools"
+          cp extracted/system.img "$AIT/INPUT_IMAGES/system.img"
+          cp extracted/product.img "$AIT/INPUT_IMAGES/product.img"
+          cp extracted/system_ext.img "$AIT/INPUT_IMAGES/system_ext.img"
+          cd "$AIT"
+          for part in system product system_ext; do
+            cat > "CONFIGS/unpack_${part}.conf" << EOF
+          ACTION=unpack
+          INPUT_IMAGE=${part}.img
+          EXTRACT_DIR=extracted_${part}
+          EOF
+            sudo --preserve-env=TERM ./android_image_tools.sh --conf="CONFIGS/unpack_${part}.conf"
+          done
+          while IFS= read -r f; do
+            sudo sed -i -E 's/^(ro\.volla\.build\.version=.*-)algiz$/\1By @Itis_Sajjad/' "$f"
+          done < <(sudo grep -RIl --include='*.prop' '^ro\.volla\.build\.version=' EXTRACTED_IMAGES/extracted_system || true)
+          while IFS= read -r f; do
+            sudo sed -i -E 's/^(ro\.lineage\.version=.*-)algiz$/\1By @Itis_Sajjad/' "$f"
+          done < <(sudo grep -RIl --include='*.prop' '^ro\.lineage\.version=' EXTRACTED_IMAGES/extracted_product EXTRACTED_IMAGES/extracted_system || true)
+          sudo grep -R --include='*.prop' -nE 'ro\.(volla\.build|lineage)\.version=' EXTRACTED_IMAGES/extracted_system EXTRACTED_IMAGES/extracted_product || true
+          sudo find EXTRACTED_IMAGES/extracted_system_ext EXTRACTED_IMAGES/extracted_system EXTRACTED_IMAGES/extracted_product -type d -path '*/priv-app/Updater' -prune -exec rm -rf {} + 2>/dev/null || true
+          for part in system product system_ext; do
+            cat > "CONFIGS/repack_${part}.conf" << EOF
+          ACTION=repack
+          SOURCE_DIR=extracted_${part}
+          OUTPUT_IMAGE=${part}_new.img
+          FILESYSTEM=erofs
+          COMPRESSION_MODE=lz4hc
+          COMPRESSION_LEVEL=9
+          CREATE_SPARSE_IMAGE=false
+          EOF
+            sudo --preserve-env=TERM ./android_image_tools.sh --conf="CONFIGS/repack_${part}.conf"
+          done
+          cd ..
+          cp "$AIT/REPACKED_IMAGES/system_new.img" extracted/system.img
+          cp "$AIT/REPACKED_IMAGES/product_new.img" extracted/product.img
+          cp "$AIT/REPACKED_IMAGES/system_ext_new.img" extracted/system_ext.img
+          ls -lh extracted/system.img extracted/product.img extracted/system_ext.img
+          
+      - name: Install lpmake
+        run: |
+          curl -fL -o lpmake "https://raw.githubusercontent.com/Rprop/aosp15_partition_tools/main/linux_glibc_x86_64/lpmake"
+          chmod +x lpmake
+          ./lpmake --help || true
 
       - name: Build super image
         if: steps.check.outputs.new_update == 'true'
-        run: python make_super.py
+        run: |
+          find_image() {
+            for suffix in "_a" ""; do
+              [ -f "extracted/$1${suffix}.img" ] && { echo "extracted/$1${suffix}.img"; return; }
+            done
+          }
+
+          SUPER_SIZE=7516192768
+          ARGS=""
+          ARGS="$ARGS --group mtk_dynamic_partitions_a:${SUPER_SIZE}"
+          ARGS="$ARGS --group mtk_dynamic_partitions_b:${SUPER_SIZE}"
+
+          for p in odm_dlkm product system system_dlkm system_ext vendor vendor_dlkm; do
+            img=$(find_image "$p")
+            if [ -z "$img" ]; then
+              echo "WARNING: $p missing — emitting empty _a/_b entries"
+              ARGS="$ARGS --partition ${p}_a:none:0:mtk_dynamic_partitions_a"
+              ARGS="$ARGS --partition ${p}_b:none:0:mtk_dynamic_partitions_b"
+              continue
+            fi
+            size=$(stat -c%s "$img")
+            echo "Using $img ($size bytes) -> ${p}_a"
+            ARGS="$ARGS --partition ${p}_a:none:${size}:mtk_dynamic_partitions_a"
+            ARGS="$ARGS --image ${p}_a=${img}"
+            ARGS="$ARGS --partition ${p}_b:none:0:mtk_dynamic_partitions_b"
+          done
+
+          ./lpmake \
+            --metadata-size 65536 \
+            --metadata-slots 3 \
+            --device-size "${SUPER_SIZE}" \
+            --super-name super \
+            $ARGS \
+            --virtual-ab \
+            --sparse \
+            --output super.img
+
+          echo "===== lpmake done, super.img size: $(stat -c%s super.img) ====="
 
       - name: Prepare flash package
         if: steps.check.outputs.new_update == 'true'
@@ -471,24 +345,24 @@ jobs:
           cat > flash_package/commands.txt << 'CMDEOF'
           Flash DariaOS 6 then reboot to bootloader;
           fastboot flash super super.img
-          fastboot --set-active=b
-          fastboot flash boot boot.img
-          fastboot flash init_boot init_boot.img
-          fastboot flash dtbo dtbo.img
-          fastboot flash vendor_boot vendor_boot.img
-          fastboot flash vbmeta vbmeta.img
-          fastboot flash vbmeta_system vbmeta_system.img
-          fastboot flash vbmeta_vendor vbmeta_vendor.img
-          fastboot flash md1img md1img.img
+          fastboot flash boot_b boot.img
+          fastboot flash init_boot_b init_boot.img
+          fastboot flash dtbo_b dtbo.img
+          fastboot flash vendor_boot_b vendor_boot.img
+          fastboot --disable-verity --disable-verification flash vbmeta_b vbmeta.img
+          fastboot --disable-verity --disable-verification flash vbmeta_system_b vbmeta_system.img
+          fastboot --disable-verity --disable-verification flash vbmeta_vendor_b vbmeta_vendor.img
+          fastboot flash md1img_b md1img.img
+          fastboot flash boot_a boot.img
+          fastboot flash init_boot_a init_boot.img
+          fastboot flash dtbo_a dtbo.img
+          fastboot flash vendor_boot_a vendor_boot.img
+          fastboot --disable-verity --disable-verification flash vbmeta_a vbmeta.img
+          fastboot --disable-verity --disable-verification flash vbmeta_system_a vbmeta_system.img
+          fastboot --disable-verity --disable-verification flash vbmeta_vendor_a vbmeta_vendor.img
+          fastboot flash md1img_a md1img.img
           fastboot --set-active=a
-          fastboot flash boot boot.img
-          fastboot flash init_boot init_boot.img
-          fastboot flash dtbo dtbo.img
-          fastboot flash vendor_boot vendor_boot.img
-          fastboot flash vbmeta vbmeta.img
-          fastboot flash vbmeta_system vbmeta_system.img
-          fastboot flash vbmeta_vendor vbmeta_vendor.img
-          fastboot flash md1img md1img.img
+
           CMDEOF
           echo "Flash package contents:"
           ls -lh flash_package/
@@ -553,7 +427,7 @@ jobs:
               echo "HAS_SCREENSHOT=true" >> "$GITHUB_ENV"
               echo "Screenshot downloaded: $(du -h screenshot.png | cut -f1)"
           fi
-          
+
       - name: Send Telegram notification
         if: steps.check.outputs.new_update == 'true'
         env:
@@ -569,7 +443,6 @@ jobs:
           <b>Updated: __DATE__</b>
 
           <blockquote>• requirement: DariaOS 6 (android 15)
-          • Don't update from settings!</blockquote>
 
           ×| <a href="__RELEASE_URL__">Download</a>
           ×| <a href="https://t.me/dariabond_group/166487">Screenshot</a>
@@ -577,7 +450,6 @@ jobs:
 
           <b>Bugs:</b>
           • you tell me
-
 
           <b>Notes:</b>
           <blockquote>• Vanilla build

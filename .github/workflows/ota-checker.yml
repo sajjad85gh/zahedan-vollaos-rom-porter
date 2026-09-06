@@ -288,12 +288,13 @@ jobs:
               [ -f "extracted/$1${suffix}.img" ] && { echo "extracted/$1${suffix}.img"; return; }
             done
           }
-
           SUPER_SIZE=7516192768
+          RESERVE=4194304
+          GROUP_A_SIZE=$((SUPER_SIZE - RESERVE))
+          GROUP_B_SIZE=$RESERVE
           ARGS=""
-          ARGS="$ARGS --group mtk_dynamic_partitions_a:${SUPER_SIZE}"
-          ARGS="$ARGS --group mtk_dynamic_partitions_b:${SUPER_SIZE}"
-
+          ARGS="$ARGS --group mtk_dynamic_partitions_a:${GROUP_A_SIZE}"
+          ARGS="$ARGS --group mtk_dynamic_partitions_b:${GROUP_B_SIZE}"
           for p in odm_dlkm product system system_dlkm system_ext vendor vendor_dlkm; do
             img=$(find_image "$p")
             if [ -z "$img" ]; then
@@ -308,7 +309,6 @@ jobs:
             ARGS="$ARGS --image ${p}_a=${img}"
             ARGS="$ARGS --partition ${p}_b:none:0:mtk_dynamic_partitions_b"
           done
-
           ./lpmake \
             --metadata-size 65536 \
             --metadata-slots 3 \
@@ -318,7 +318,6 @@ jobs:
             --virtual-ab \
             --sparse \
             --output super.img
-
           echo "===== lpmake done, super.img size: $(stat -c%s super.img) ====="
 
       - name: Prepare flash package

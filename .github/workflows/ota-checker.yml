@@ -189,91 +189,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android
           df -h /
           
-      - name: Install Android Image Tools dependencies
-        if: steps.check.outputs.new_update == 'true'
-        run: |
-          set -e
-          export TERM=xterm-256color
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            android-sdk-libsparse-utils \
-            build-essential \
-            automake \
-            autoconf \
-            libtool \
-            pkg-config \
-            git \
-            fuse3 \
-            e2fsprogs \
-            pv \
-            liblz4-dev \
-            uuid-dev \
-            libfuse3-dev \
-            f2fs-tools \
-            fuse2fs \
-            attr \
-            zlib1g-dev \
-            rsync
-          if ! command -v mkfs.erofs >/dev/null || ! command -v erofsfuse >/dev/null; then
-            git clone --depth 1 https://github.com/erofs/erofs-utils.git /tmp/erofs-utils
-            cd /tmp/erofs-utils
-            ./autogen.sh
-            ./configure --enable-fuse
-            make -j"$(nproc)"
-            sudo make install
-            sudo ldconfig
-            cd -
-            rm -rf /tmp/erofs-utils
-          fi
-
-      - name: Clone Android Image Tools
-        if: steps.check.outputs.new_update == 'true'
-        run: git clone --branch v4 --depth 1 https://github.com/ravindu644/Android_Image_Tools.git
-
-      - name: Add my name to settings and remove stock Updater
-        if: steps.check.outputs.new_update == 'true'
-        run: |
-          set -e
-          export TERM=xterm-256color
-          AIT="Android_Image_Tools"
-          cp extracted/system.img "$AIT/INPUT_IMAGES/system.img"
-          cp extracted/product.img "$AIT/INPUT_IMAGES/product.img"
-          cp extracted/system_ext.img "$AIT/INPUT_IMAGES/system_ext.img"
-          cd "$AIT"
-          for part in system product system_ext; do
-            cat > "CONFIGS/unpack_${part}.conf" << EOF
-          ACTION=unpack
-          INPUT_IMAGE=${part}.img
-          EXTRACT_DIR=extracted_${part}
-          EOF
-            sudo --preserve-env=TERM ./android_image_tools.sh --conf="CONFIGS/unpack_${part}.conf"
-          done
-          while IFS= read -r f; do
-            sudo sed -i -E 's/^(ro\.volla\.build\.version=.*-)algiz$/\1By @Itis_Sajjad/' "$f"
-          done < <(sudo grep -RIl --include='*.prop' '^ro\.volla\.build\.version=' EXTRACTED_IMAGES/extracted_system || true)
-          while IFS= read -r f; do
-            sudo sed -i -E 's/^(ro\.lineage\.version=.*-)algiz$/\1By @Itis_Sajjad/' "$f"
-          done < <(sudo grep -RIl --include='*.prop' '^ro\.lineage\.version=' EXTRACTED_IMAGES/extracted_product EXTRACTED_IMAGES/extracted_system || true)
-          sudo grep -R --include='*.prop' -nE 'ro\.(volla\.build|lineage)\.version=' EXTRACTED_IMAGES/extracted_system EXTRACTED_IMAGES/extracted_product || true
-          sudo find EXTRACTED_IMAGES/extracted_system_ext EXTRACTED_IMAGES/extracted_system EXTRACTED_IMAGES/extracted_product -type d -path '*/priv-app/Updater' -prune -exec rm -rf {} + 2>/dev/null || true
-          for part in system product system_ext; do
-            cat > "CONFIGS/repack_${part}.conf" << EOF
-          ACTION=repack
-          SOURCE_DIR=extracted_${part}
-          OUTPUT_IMAGE=${part}_new.img
-          FILESYSTEM=erofs
-          COMPRESSION_MODE=lz4hc
-          COMPRESSION_LEVEL=9
-          CREATE_SPARSE_IMAGE=false
-          EOF
-            sudo --preserve-env=TERM ./android_image_tools.sh --conf="CONFIGS/repack_${part}.conf"
-          done
-          cd ..
-          cp "$AIT/REPACKED_IMAGES/system_new.img" extracted/system.img
-          cp "$AIT/REPACKED_IMAGES/product_new.img" extracted/product.img
-          cp "$AIT/REPACKED_IMAGES/system_ext_new.img" extracted/system_ext.img
-          ls -lh extracted/system.img extracted/product.img extracted/system_ext.img
-          
       - name: Install lpmake
         run: |
           curl -fL -o lpmake "https://raw.githubusercontent.com/Rprop/aosp15_partition_tools/main/linux_glibc_x86_64/lpmake"
@@ -348,17 +263,17 @@ jobs:
           fastboot flash init_boot_b init_boot.img
           fastboot flash dtbo_b dtbo.img
           fastboot flash vendor_boot_b vendor_boot.img
-          fastboot --disable-verity --disable-verification flash vbmeta_b vbmeta.img
-          fastboot --disable-verity --disable-verification flash vbmeta_system_b vbmeta_system.img
-          fastboot --disable-verity --disable-verification flash vbmeta_vendor_b vbmeta_vendor.img
+          fastboot flash vbmeta_b vbmeta.img
+          fastboot flash vbmeta_system_b vbmeta_system.img
+          fastboot flash vbmeta_vendor_b vbmeta_vendor.img
           fastboot flash md1img_b md1img.img
           fastboot flash boot_a boot.img
           fastboot flash init_boot_a init_boot.img
           fastboot flash dtbo_a dtbo.img
           fastboot flash vendor_boot_a vendor_boot.img
-          fastboot --disable-verity --disable-verification flash vbmeta_a vbmeta.img
-          fastboot --disable-verity --disable-verification flash vbmeta_system_a vbmeta_system.img
-          fastboot --disable-verity --disable-verification flash vbmeta_vendor_a vbmeta_vendor.img
+          fastboot flash vbmeta_a vbmeta.img
+          fastboot flash vbmeta_system_a vbmeta_system.img
+          fastboot flash vbmeta_vendor_a vbmeta_vendor.img
           fastboot flash md1img_a md1img.img
           fastboot --set-active=a
 

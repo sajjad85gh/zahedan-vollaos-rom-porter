@@ -241,7 +241,7 @@ jobs:
           mkdir -p flash_package
           cp super.img flash_package/
           MISSING=0
-          for img in boot init_boot vendor_boot dtbo vbmeta vbmeta_system vbmeta_vendor md1img; do
+          for img in boot init_boot vendor_boot dtbo vbmeta vbmeta_system vbmeta_vendor; do
               FOUND=0
               for suffix in "" "_a"; do
                   if [ -f "extracted/${img}${suffix}.img" ]; then
@@ -266,7 +266,6 @@ jobs:
           fastboot flash vbmeta_b vbmeta.img
           fastboot flash vbmeta_system_b vbmeta_system.img
           fastboot flash vbmeta_vendor_b vbmeta_vendor.img
-          fastboot flash md1img_b md1img.img
           fastboot flash boot_a boot.img
           fastboot flash init_boot_a init_boot.img
           fastboot flash dtbo_a dtbo.img
@@ -274,7 +273,6 @@ jobs:
           fastboot flash vbmeta_a vbmeta.img
           fastboot flash vbmeta_system_a vbmeta_system.img
           fastboot flash vbmeta_vendor_a vbmeta_vendor.img
-          fastboot flash md1img_a md1img.img
           fastboot --set-active=a
 
           CMDEOF

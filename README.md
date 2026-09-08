@@ -8,3 +8,4 @@ Automated GitHub Action that pulls **Volla (algiz) stable OTAs**, extracts parti
 ### Flash guide
 1. Extract the release (`7z x volla-algiz-stable.7z.001`).
 2. Boot to bootloader, flash per `commands.txt`
+3. Don't update from settings!

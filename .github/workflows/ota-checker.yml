@@ -429,60 +429,161 @@ jobs:
       - name: Prepare flash package
         if: steps.check.outputs.new_update == 'true'
         run: |
+          set -euo pipefail
           mkdir -p flash_package
-          cp super.img flash_package/
-          MISSING=0
-          for img in boot init_boot vendor_boot dtbo vbmeta vbmeta_system vbmeta_vendor; do
-              FOUND=0
-              for suffix in "" "_a"; do
-                  if [ -f "extracted/${img}${suffix}.img" ]; then
-                      cp "extracted/${img}${suffix}.img" "flash_package/${img}.img"
-                      FOUND=1
-                      echo "Found ${img}${suffix}.img"
-                      break
-                  fi
-              done
-              if [ "$FOUND" = "0" ]; then
-                  echo "WARNING: ${img}.img not found in extracted files"
-                  MISSING=1
-              fi
+
+          if [ ! -s super.img ]; then
+            echo "FATAL: super.img was not built"
+            exit 1
+          fi
+          cp -f super.img flash_package/super.img
+
+          if [ ! -s vbmeta-disabled.img ]; then
+            echo "FATAL: vbmeta-disabled.img is missing from the repository root"
+            exit 1
+          fi
+          cp -f vbmeta-disabled.img flash_package/vbmeta-disabled.img
+
+          is_skipped_part() {
+            case "$1" in
+              lk|preloader|preloader_*|payload) return 0 ;;
+              system|system_ext|system_dlkm|vendor|vendor_dlkm|product|odm|odm_dlkm|super) return 0 ;;
+              vbmeta|vbmeta_system|vbmeta_vendor) return 0 ;;
+              userdata|metadata|misc|para|persist|nvcfg|nvdata|protect1|protect2|seccfg|proinfo|nvram|expdb|bootloader) return 0 ;;
+            esac
+            return 1
+          }
+
+          declare -A BEST_SCORE=()
+          declare -A BEST_SRC=()
+          shopt -s nullglob
+          for f in extracted/*; do
+            base=$(basename "$f")
+            case "$base" in
+              *.img|*.bin) ;;
+              *) continue ;;
+            esac
+            stem="${base%.*}"
+            part="$stem"
+            score=3
+            if [[ "$stem" =~ ^(.+)_(a|b)$ ]]; then
+              part="${BASH_REMATCH[1]}"
+              if [[ "$stem" == *_a ]]; then score=2; else score=1; fi
+            fi
+            if is_skipped_part "$part"; then
+              echo "Skipping ${base}"
+              continue
+            fi
+            prev=${BEST_SCORE[$part]:-0}
+            if [ "$score" -ge "$prev" ]; then
+              BEST_SCORE[$part]=$score
+              BEST_SRC[$part]="$f"
+            fi
           done
-          cat > flash_package/commands.txt << 'CMDEOF'
-          Flash DariaOS 6 then reboot to bootloader;
-          fastboot flash super super.img
-          fastboot flash boot_b boot.img
-          fastboot flash init_boot_b init_boot.img
-          fastboot flash dtbo_b dtbo.img
-          fastboot flash vendor_boot_b vendor_boot.img
-          fastboot flash vbmeta_b vbmeta.img
-          fastboot flash vbmeta_system_b vbmeta_system.img
-          fastboot flash vbmeta_vendor_b vbmeta_vendor.img
-          fastboot flash boot_a boot.img
-          fastboot flash init_boot_a init_boot.img
-          fastboot flash dtbo_a dtbo.img
-          fastboot flash vendor_boot_a vendor_boot.img
-          fastboot flash vbmeta_a vbmeta.img
-          fastboot flash vbmeta_system_a vbmeta_system.img
-          fastboot flash vbmeta_vendor_a vbmeta_vendor.img
-          fastboot --set-active=a
-          CMDEOF
+
+          for part in "${!BEST_SRC[@]}"; do
+            src="${BEST_SRC[$part]}"
+            ext="${src##*.}"
+            cp -f "$src" "flash_package/${part}.${ext}"
+            echo "Packed $(basename "$src") -> ${part}.${ext}"
+          done
+
+          missing=0
+          for part in cam_vpu1 cam_vpu2 cam_vpu3 dpm gz mcupm pi_img scp spmfw sspm tee boot dtbo md1img; do
+            if [ ! -f "flash_package/${part}.img" ] && [ ! -f "flash_package/${part}.bin" ]; then
+              echo "FATAL: required image not in OTA payload: ${part}"
+              missing=1
+            fi
+          done
+          if [ "$missing" = "1" ]; then
+            echo "Extracted files:"
+            ls -lh extracted/ || true
+            exit 1
+          fi
+
+          packed_file() {
+            local part="$1"
+            if [ -f "flash_package/${part}.img" ]; then
+              printf '%s\n' "${part}.img"
+            elif [ -f "flash_package/${part}.bin" ]; then
+              printf '%s\n' "${part}.bin"
+            fi
+          }
+
+          flash_both() {
+            local part="$1" file="$2"
+            printf 'fastboot flash %s_a %s\n' "$part" "$file"
+            printf 'fastboot flash %s_b %s\n' "$part" "$file"
+          }
+
+          FIRMWARE=(md1img spmfw pi_img dpm scp sspm mcupm cam_vpu1 cam_vpu2 cam_vpu3 gz tee)
+          BOOT=(boot dtbo init_boot vendor_boot)
+          declare -A HANDLED=()
+          for part in "${FIRMWARE[@]}" "${BOOT[@]}"; do
+            HANDLED[$part]=1
+          done
+
+          find flash_package -maxdepth 1 -type f \( -name '*.img' -o -name '*.bin' \) -printf '%f\n' | sort > /tmp/flash_pkg_files.txt
+
+          {
+            echo "Flash DariaOS 6, then reboot to bootloader."
+            echo "lk and preloader are intentionally NOT included."
+            echo "Stock vbmeta is not used. vbmeta / vbmeta_system / vbmeta_vendor are flashed from vbmeta-disabled.img on both slots, otherwise the patched images will not boot."
+            echo
+            echo "fastboot --set-active=a"
+            echo
+            for part in "${FIRMWARE[@]}"; do
+              file=$(packed_file "$part")
+              if [ -n "$file" ]; then
+                flash_both "$part" "$file"
+              fi
+            done
+            while IFS= read -r file; do
+              [ -n "$file" ] || continue
+              part="${file%.*}"
+              case "$part" in
+                super|vbmeta-disabled) continue ;;
+              esac
+              if [ -n "${HANDLED[$part]:-}" ]; then
+                continue
+              fi
+              flash_both "$part" "$file"
+            done < /tmp/flash_pkg_files.txt
+            echo
+            for part in "${BOOT[@]}"; do
+              file=$(packed_file "$part")
+              if [ -n "$file" ]; then
+                flash_both "$part" "$file"
+              else
+                echo "# ${part}: not in this OTA payload, skipped"
+              fi
+            done
+            echo
+            echo "fastboot flash super super.img"
+            echo
+            echo "fastboot flash vbmeta_a vbmeta-disabled.img"
+            echo "fastboot flash vbmeta_b vbmeta-disabled.img"
+            echo "fastboot flash vbmeta_system_a vbmeta-disabled.img"
+            echo "fastboot flash vbmeta_system_b vbmeta-disabled.img"
+            echo "fastboot flash vbmeta_vendor_a vbmeta-disabled.img"
+            echo "fastboot flash vbmeta_vendor_b vbmeta-disabled.img"
+            echo
+            echo "fastboot --set-active=a"
+            echo "fastboot reboot"
+          } > flash_package/commands.txt
+
           echo "Flash package contents:"
           ls -lh flash_package/
-          if [ "$MISSING" = "1" ]; then
-              echo ""
-              echo "NOTE: Some images were missing from the OTA payload."
-              echo "The flash package is incomplete. Check the warnings above."
-          fi
+          echo "----- commands.txt -----"
+          cat flash_package/commands.txt
 
       - name: Free space - remove extracted partition images
         if: steps.check.outputs.new_update == 'true'
         run: |
-          for p in system system_ext system_dlkm vendor vendor_dlkm product odm_dlkm; do
-              rm -f "extracted/${p}.img" "extracted/${p}_a.img"
-          done
-          rm -f extracted/payload.bin
-          echo "Remaining in extracted/:"
-          ls -lh extracted/ 2>/dev/null || echo "(empty or removed)"
+          rm -rf extracted super.img
+          echo "Remaining workspace usage:"
+          du -h --max-depth=1 . | sort -h || true
+          df -h /
 
       - name: Compress and split for upload
         if: steps.check.outputs.new_update == 'true'
@@ -513,7 +614,9 @@ jobs:
             > All parts must be in the same folder. Only extract the `.001` file, the rest are loaded automatically.
 
             ## Flash
-            See `commands.txt` inside the extracted folder for fastboot commands.
+            See `commands.txt` inside the extracted folder.
+
+            Every payload partition is flashed to both slots, except `lk` and `preloader` (not included). `super.img` is the repacked super. `vbmeta`, `vbmeta_system` and `vbmeta_vendor` are flashed from `vbmeta-disabled.img` — stock vbmeta will not boot builds.
           files: volla-algiz-stable.7z.*
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -544,22 +647,24 @@ jobs:
           <b><u>VollaOS __VERSION__ | Android __ANDROID_MAJOR__.</u></b>
           <b>Updated: __DATE__</b>
 
-          <blockquote>• requirement: DariaOS 6 (android 15)
-          • Don't update from settings!</blockquote>
+          <blockquote>• Requirement: DariaOS 6 (Android 15)
+          • Updater removed
+          • Don’t use ADB sideload for updates!</blockquote>
 
           ×| <a href="__RELEASE_URL__">Download</a>
+
           ×| <a href="https://t.me/dariabond_group/166487">Screenshot</a>
           ×| <a href="https://t.me/dariabond_group/172813">Flash guide</a>
 
           <b>Bugs:</b>
-          </blockquote>• you tell me</blockquote>
+          <blockquote>• You tell me</blockquote>
 
           <b>Notes:</b>
           <blockquote>• Vanilla build
-          • to add udfps screenoff see #udfps_longpress_screenoff note
+          • To enable UDFPS while the screen is off, see the #udfps_longpress_screenoff note
           • MicroG included
-          • backup important partitions (see #important_backups note)
-          • Report bug with proper log</blockquote>
+          • Back up important partitions (see the #important_backups note)
+          • Report bugs with proper logs</blockquote>
 
           <blockquote><i>⚠ This ROM is built automatically and may brick your device. Flash at your own risk.</i></blockquote>
 

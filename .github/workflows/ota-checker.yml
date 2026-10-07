@@ -529,7 +529,7 @@ jobs:
           find flash_package -maxdepth 1 -type f \( -name '*.img' -o -name '*.bin' \) -printf '%f\n' | sort > /tmp/flash_pkg_files.txt
 
           {
-            echo "Flash DariaOS 6, then reboot to bootloader."
+            echo "reboot to bootloader."
             echo "lk and preloader come from DariaOS (prebuilt/), not from the Volla."
             echo "Stock vbmeta is not used. vbmeta / vbmeta_system / vbmeta_vendor are flashed from vbmeta-disabled.img on both slots, otherwise the patched images will not boot."
             echo
@@ -658,9 +658,8 @@ jobs:
           • Don’t use ADB sideload for updates!</blockquote>
 
           ×| <a href="__RELEASE_URL__">Download</a>
-
           ×| <a href="https://t.me/dariabond_group/166487">Screenshot</a>
-          ×| <a href="https://t.me/dariabond_group/172813">Flash guide</a>
+          ×| <a href="https://t.me/dariabond_group/172813">Flashing Guide</a>
 
           <b>Bugs:</b>
           <blockquote>• You tell me</blockquote>

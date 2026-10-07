@@ -438,11 +438,13 @@ jobs:
           fi
           cp -f super.img flash_package/super.img
 
-          if [ ! -s vbmeta-disabled.img ]; then
-            echo "FATAL: vbmeta-disabled.img is missing from the repository root"
-            exit 1
-          fi
-          cp -f vbmeta-disabled.img flash_package/vbmeta-disabled.img
+          for img in vbmeta-disabled lk preloader; do
+            if [ ! -s "prebuilt/${img}.img" ]; then
+              echo "FATAL: prebuilt/${img}.img is missing from the repository"
+              exit 1
+            fi
+            cp -f "prebuilt/${img}.img" "flash_package/${img}.img"
+          done
 
           is_skipped_part() {
             case "$1" in
@@ -518,8 +520,9 @@ jobs:
 
           FIRMWARE=(md1img spmfw pi_img dpm scp sspm mcupm cam_vpu1 cam_vpu2 cam_vpu3 gz tee)
           BOOT=(boot dtbo init_boot vendor_boot)
+          PREBUILT=(preloader lk)
           declare -A HANDLED=()
-          for part in "${FIRMWARE[@]}" "${BOOT[@]}"; do
+          for part in "${FIRMWARE[@]}" "${BOOT[@]}" "${PREBUILT[@]}"; do
             HANDLED[$part]=1
           done
 
@@ -527,10 +530,14 @@ jobs:
 
           {
             echo "Flash DariaOS 6, then reboot to bootloader."
-            echo "lk and preloader are intentionally NOT included."
+            echo "lk and preloader come from DariaOS (prebuilt/), not from the Volla."
             echo "Stock vbmeta is not used. vbmeta / vbmeta_system / vbmeta_vendor are flashed from vbmeta-disabled.img on both slots, otherwise the patched images will not boot."
             echo
             echo "fastboot --set-active=a"
+            echo
+            for part in "${PREBUILT[@]}"; do
+              flash_both "$part" "${part}.img"
+            done
             echo
             for part in "${FIRMWARE[@]}"; do
               file=$(packed_file "$part")
@@ -616,7 +623,7 @@ jobs:
             ## Flash
             See `commands.txt` inside the extracted folder.
 
-            Every payload partition is flashed to both slots, except `lk` and `preloader` (not included). `super.img` is the repacked super. `vbmeta`, `vbmeta_system` and `vbmeta_vendor` are flashed from `vbmeta-disabled.img` — stock vbmeta will not boot builds.
+            Every payload partition is flashed to both slots. `lk` and `preloader` are taken from DariaOS. `super.img` is the repacked super. `vbmeta`, `vbmeta_system` and `vbmeta_vendor` are flashed from `vbmeta-disabled.img` — stock vbmeta will not boot builds.
           files: volla-algiz-stable.7z.*
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -647,8 +654,7 @@ jobs:
           <b><u>VollaOS __VERSION__ | Android __ANDROID_MAJOR__.</u></b>
           <b>Updated: __DATE__</b>
 
-          <blockquote>• Requirement: DariaOS 6 (Android 15)
-          • Updater removed
+          <blockquote>• Updater removed
           • Don’t use ADB sideload for updates!</blockquote>
 
           ×| <a href="__RELEASE_URL__">Download</a>

@@ -529,12 +529,6 @@ jobs:
           find flash_package -maxdepth 1 -type f \( -name '*.img' -o -name '*.bin' \) -printf '%f\n' | sort > /tmp/flash_pkg_files.txt
 
           {
-            echo "reboot to bootloader."
-            echo "lk and preloader come from DariaOS (prebuilt/), not from the Volla."
-            echo "Stock vbmeta is not used. vbmeta / vbmeta_system / vbmeta_vendor are flashed from vbmeta-disabled.img on both slots, otherwise the patched images will not boot."
-            echo
-            echo "fastboot --set-active=a"
-            echo
             for part in "${PREBUILT[@]}"; do
               flash_both "$part" "${part}.img"
             done

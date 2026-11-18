@@ -426,6 +426,21 @@ jobs:
             --output super.img
           echo "===== lpmake done, super.img size: $(stat -c%s super.img) ====="
 
+      - name: Download latest platform-tools (Windows)
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 10 -o platform-tools-windows.zip \
+            "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
+          unzip -q platform-tools-windows.zip
+          if [ ! -f platform-tools/fastboot.exe ]; then
+            echo "FATAL: platform-tools/fastboot.exe not found after extraction"
+            exit 1
+          fi
+          rm -f platform-tools-windows.zip
+          echo "platform-tools contents:"
+          ls -lh platform-tools/ | head -n 30
+
       - name: Prepare flash package
         if: steps.check.outputs.new_update == 'true'
         run: |
@@ -446,56 +461,24 @@ jobs:
             cp -f "prebuilt/${img}.img" "flash_package/${img}.img"
           done
 
-          is_skipped_part() {
-            case "$1" in
-              lk|preloader|preloader_*|payload) return 0 ;;
-              system|system_ext|system_dlkm|vendor|vendor_dlkm|product|odm|odm_dlkm|super) return 0 ;;
-              vbmeta|vbmeta_system|vbmeta_vendor) return 0 ;;
-              userdata|metadata|misc|para|persist|nvcfg|nvdata|protect1|protect2|seccfg|proinfo|nvram|expdb|bootloader) return 0 ;;
-            esac
-            return 1
-          }
-
-          declare -A BEST_SCORE=()
-          declare -A BEST_SRC=()
-          shopt -s nullglob
-          for f in extracted/*; do
-            base=$(basename "$f")
-            case "$base" in
-              *.img|*.bin) ;;
-              *) continue ;;
-            esac
-            stem="${base%.*}"
-            part="$stem"
-            score=3
-            if [[ "$stem" =~ ^(.+)_(a|b)$ ]]; then
-              part="${BASH_REMATCH[1]}"
-              if [[ "$stem" == *_a ]]; then score=2; else score=1; fi
-            fi
-            if is_skipped_part "$part"; then
-              echo "Skipping ${base}"
-              continue
-            fi
-            prev=${BEST_SCORE[$part]:-0}
-            if [ "$score" -ge "$prev" ]; then
-              BEST_SCORE[$part]=$score
-              BEST_SRC[$part]="$f"
-            fi
-          done
-
-          for part in "${!BEST_SRC[@]}"; do
-            src="${BEST_SRC[$part]}"
-            ext="${src##*.}"
-            cp -f "$src" "flash_package/${part}.${ext}"
-            echo "Packed $(basename "$src") -> ${part}.${ext}"
-          done
+          # Partitions taken from the OTA payload (flashed to both slots)
+          PAYLOAD_PARTS=(md1img spmfw pi_img dpm scp sspm mcupm cam_vpu1 cam_vpu2 cam_vpu3 gz tee boot dtbo init_boot vendor_boot)
 
           missing=0
-          for part in cam_vpu1 cam_vpu2 cam_vpu3 dpm gz mcupm pi_img scp spmfw sspm tee boot dtbo md1img; do
-            if [ ! -f "flash_package/${part}.img" ] && [ ! -f "flash_package/${part}.bin" ]; then
+          for part in "${PAYLOAD_PARTS[@]}"; do
+            src=""
+            for cand in \
+              "extracted/${part}.img" "extracted/${part}_a.img" "extracted/${part}_b.img" \
+              "extracted/${part}.bin" "extracted/${part}_a.bin" "extracted/${part}_b.bin"; do
+              if [ -f "$cand" ]; then src="$cand"; break; fi
+            done
+            if [ -z "$src" ]; then
               echo "FATAL: required image not in OTA payload: ${part}"
               missing=1
+              continue
             fi
+            cp -f "$src" "flash_package/${part}.img"
+            echo "Packed $(basename "$src") -> ${part}.img"
           done
           if [ "$missing" = "1" ]; then
             echo "Extracted files:"
@@ -503,75 +486,12 @@ jobs:
             exit 1
           fi
 
-          packed_file() {
-            local part="$1"
-            if [ -f "flash_package/${part}.img" ]; then
-              printf '%s\n' "${part}.img"
-            elif [ -f "flash_package/${part}.bin" ]; then
-              printf '%s\n' "${part}.bin"
-            fi
-          }
+          # Flash scripts + command list (single source of truth lives in flash/)
+          cp -f flash/commands.txt flash/flash_all.sh flash/flash_all.bat flash_package/
+          chmod +x flash_package/flash_all.sh
 
-          flash_both() {
-            local part="$1" file="$2"
-            printf 'fastboot flash %s_a %s\n' "$part" "$file"
-            printf 'fastboot flash %s_b %s\n' "$part" "$file"
-          }
-
-          FIRMWARE=(md1img spmfw pi_img dpm scp sspm mcupm cam_vpu1 cam_vpu2 cam_vpu3 gz tee)
-          BOOT=(boot dtbo init_boot vendor_boot)
-          PREBUILT=(preloader lk)
-          declare -A HANDLED=()
-          for part in "${FIRMWARE[@]}" "${BOOT[@]}" "${PREBUILT[@]}"; do
-            HANDLED[$part]=1
-          done
-
-          find flash_package -maxdepth 1 -type f \( -name '*.img' -o -name '*.bin' \) -printf '%f\n' | sort > /tmp/flash_pkg_files.txt
-
-          {
-            for part in "${PREBUILT[@]}"; do
-              flash_both "$part" "${part}.img"
-            done
-            echo
-            for part in "${FIRMWARE[@]}"; do
-              file=$(packed_file "$part")
-              if [ -n "$file" ]; then
-                flash_both "$part" "$file"
-              fi
-            done
-            while IFS= read -r file; do
-              [ -n "$file" ] || continue
-              part="${file%.*}"
-              case "$part" in
-                super|vbmeta-disabled) continue ;;
-              esac
-              if [ -n "${HANDLED[$part]:-}" ]; then
-                continue
-              fi
-              flash_both "$part" "$file"
-            done < /tmp/flash_pkg_files.txt
-            echo
-            for part in "${BOOT[@]}"; do
-              file=$(packed_file "$part")
-              if [ -n "$file" ]; then
-                flash_both "$part" "$file"
-              else
-                echo "# ${part}: not in this OTA payload, skipped"
-              fi
-            done
-            echo
-            echo "fastboot flash super super.img"
-            echo
-            echo "fastboot flash vbmeta_a vbmeta-disabled.img"
-            echo "fastboot flash vbmeta_b vbmeta-disabled.img"
-            echo "fastboot flash vbmeta_system_a vbmeta-disabled.img"
-            echo "fastboot flash vbmeta_system_b vbmeta-disabled.img"
-            echo "fastboot flash vbmeta_vendor_a vbmeta-disabled.img"
-            echo "fastboot flash vbmeta_vendor_b vbmeta-disabled.img"
-            echo
-            echo "fastboot --set-active=a"
-            echo "fastboot reboot"
-          } > flash_package/commands.txt
+          # Bundled Windows platform-tools (latest, downloaded above)
+          cp -a platform-tools flash_package/platform-tools
 
           echo "Flash package contents:"
           ls -lh flash_package/
@@ -581,7 +501,7 @@ jobs:
       - name: Free space - remove extracted partition images
         if: steps.check.outputs.new_update == 'true'
         run: |
-          rm -rf extracted super.img
+          rm -rf extracted super.img platform-tools
           echo "Remaining workspace usage:"
           du -h --max-depth=1 . | sort -h || true
           df -h /
@@ -605,18 +525,33 @@ jobs:
           name: "Volla Algiz Stable ${{ steps.check.outputs.version_date }}"
           body: |
             ## Download & Extract
-            **Linux/Mac:**
-            ```bash
-            7z x volla-algiz-stable.7z.001
-            ```
-            **Windows:**
-            Right-click on `volla-algiz-stable.7z.001` → Extract with 7-Zip
+            Download **all** `volla-algiz-stable.7z.*` parts into the **same folder**, then extract **only the `.001` file**, the rest are loaded automatically.
 
-            > All parts must be in the same folder. Only extract the `.001` file, the rest are loaded automatically.
+            **Windows:** right-click `volla-algiz-stable.7z.001` → 7-Zip → Extract Here
+            **Linux/Mac:** `7z x volla-algiz-stable.7z.001`
 
             ## Flash
-            See `commands.txt` inside the extracted folder.
+            First reboot the phone to the bootloader: `adb reboot bootloader` (or power off and hold Volume Down + Power).
 
+            ### Windows users
+            Nothing to install, the latest platform-tools is bundled in the `platform-tools` folder.
+            1. Open the extracted folder (don't move/delete the `platform-tools` folder).
+            2. Double-click **`flash_all.bat`**.
+            3. Type `YES` and press Enter, then wait for **DONE**.
+
+            If an error happens the window stays open and shows the error text. Don't reboot into the system until it's resolved.
+            If it keeps waiting for the device, check the cable/port and install the Google USB Driver or the MediaTek USB driver.
+
+            ### Linux / Mac users
+            1. Install `fastboot` (`sudo apt install fastboot` on Debian/Ubuntu, `sudo pacman -S android-tools` on Arch, `sudo dnf install android-tools` on Fedora), or put Google's platform-tools folder next to the script as `platform-tools/`.
+            2. Open a terminal in the extracted folder and run: `bash flash_all.sh`
+            3. Type `YES` and press Enter, then wait for **Done**.
+
+            If the phone isn't detected, install your distro's `android-udev-rules` package (or try the script with `sudo`).
+
+            The phone reboots to recovery when flashing finishes. The manual command list is in `commands.txt`.
+
+            ## Notes
             Every payload partition is flashed to both slots. `lk` and `preloader` are taken from DariaOS. `super.img` is the repacked super. `vbmeta`, `vbmeta_system` and `vbmeta_vendor` are flashed from `vbmeta-disabled.img` — stock vbmeta will not boot builds.
           files: volla-algiz-stable.7z.*
         env:

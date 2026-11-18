@@ -15,16 +15,54 @@ A GitHub Action checks the Volla OTA server every day. When a new stable build a
 ## Requirements
 
 - Daria Bond I with an **unlocked bootloader**
-- `fastboot` (platform-tools) and **7-Zip** on your PC
+- **7-Zip** on your PC
+- A good USB cable (plug it directly into the PC, avoid hubs)
+
+## Download & extract
+
+1. Download **all** `volla-algiz-stable.7z.*` parts from the latest release into **one folder**.
+2. Extract **only the first part** (`.001`), the rest are picked up automatically:
+   - **Windows:** right-click `volla-algiz-stable.7z.001` → *7-Zip* → *Extract Here*
+   - **Linux/Mac:** `7z x volla-algiz-stable.7z.001`
 
 ## Flashing guide
 
-1. Download **all** `volla-algiz-stable.7z.*` parts from the latest release into one folder.
-2. Extract only the first part:
+Reboot the phone to the bootloader first: `adb reboot bootloader`, or power off and hold *Volume Down + Power*.
+
+### Windows
+
+Nothing to install: the latest `platform-tools` is bundled in the `platform-tools` folder.
+
+1. Open the extracted folder (keep the `platform-tools` folder next to the scripts and images).
+2. Double-click **`flash_all.bat`**.
+3. Type `YES` and press Enter.
+4. Wait until it says **DONE**. The phone reboots to recovery by itself.
+
+If something goes wrong, the window **stays open** and shows the error. Don't close it before reading it, and don't reboot into the system.
+If the script waits forever on *"Waiting for a device in fastboot mode..."*, the phone isn't detected: check the cable/port and install the Google USB Driver (or the MediaTek USB driver) from Device Manager.
+
+### Linux / Mac
+
+1. Install `fastboot`, for example:
+   - Debian/Ubuntu: `sudo apt install fastboot`
+   - Arch: `sudo pacman -S android-tools`
+   - Fedora: `sudo dnf install android-tools`
+   - or download [platform-tools](https://developer.android.com/tools/releases/platform-tools) from Google and put its folder next to the script as `platform-tools/`
+2. Open a terminal in the extracted folder and run:
    ```bash
-   7z x volla-algiz-stable.7z.001
+   bash flash_all.sh
    ```
-   On Windows: right-click `.001` → *Extract with 7-Zip*.
-3. Reboot to the bootloader (`adb reboot bootloader`).
-4. Flash the commands in `commands.txt` **in the order listed**. The order is intentional.
-5. Reboot.
+3. Type `YES` and press Enter.
+4. Wait until it says **Done**. The phone reboots to recovery by itself.
+
+If the phone is not detected on Linux, install your distro's `android-udev-rules` package (or run the script with `sudo` as a quick test).
+
+### Manual flashing
+
+Prefer to type the commands yourself? The exact same commands, in the same (intentional) order, are in `commands.txt`.
+
+## Repository layout
+
+- `flash/` – `commands.txt`, `flash_all.sh`, `flash_all.bat` (copied into every release package)
+- `prebuilt/` – `lk`, `preloader`, `vbmeta-disabled`
+- `.github/workflows/ota-checker.yml` – daily OTA check, repack and release

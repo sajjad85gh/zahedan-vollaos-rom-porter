@@ -1097,6 +1097,9 @@ jobs:
           # 6. Bundle Windows platform-tools and Dual-Boot flash scripts
           cp -a platform-tools ut_dualboot_package/platform-tools
           rm -rf platform-tools
+          cp -f flash/prepare_gpt.sh ut_dualboot_package/prepare_gpt.sh
+          cp -f flash/gpt_edit.py ut_dualboot_package/gpt_edit.py
+          chmod +x ut_dualboot_package/prepare_gpt.sh
 
           cat << 'SHEOF' > ut_dualboot_package/flash_ut_slot_b.sh
           #!/usr/bin/env bash
@@ -1109,7 +1112,7 @@ jobs:
           echo "  Ubuntu Touch Dual-Boot Installer (Slot B) for Daria Bond"
           echo "  - Keeps VollaOS 16 untouched on Slot A"
           echo "  - Includes built-in 'Switch to VollaOS' one-tap app icon"
-          echo "  Prerequisite: GPT partitions 'linux_system' (10G) & 'linux_data'"
+          echo "  Prerequisite: GPT partitions 'linux_system' & 'linux_data' (run prepare_gpt.sh first)"
           echo "================================================================"
           read -r -p "Type YES to flash Ubuntu Touch to Slot B: " CONFIRM
           [ "$CONFIRM" = "YES" ] || { echo "Aborted."; exit 1; }
@@ -1143,7 +1146,7 @@ jobs:
           echo   Ubuntu Touch Dual-Boot Installer (Slot B) for Daria Bond
           echo   - Keeps VollaOS 16 untouched on Slot A
           echo   - Includes built-in 'Switch to VollaOS' one-tap app icon
-          echo   Prerequisite: GPT partitions 'linux_system' (10G) ^& 'linux_data'
+          echo   Prerequisite: GPT partitions 'linux_system' ^& 'linux_data' ^(run prepare_gpt.sh first^)
           echo ================================================================
           set /p CONFIRM=Type YES to flash Ubuntu Touch to Slot B: 
           if /I not "%CONFIRM%"=="YES" (

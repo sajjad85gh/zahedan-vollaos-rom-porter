@@ -46,7 +46,6 @@ If the script waits forever on *"Waiting for a device in fastboot mode..."*, ins
 1. Install `fastboot`:
    - Debian/Ubuntu: `sudo apt install fastboot`
    - Arch: `sudo pacman -S android-tools`
-   - Fedora: `sudo dnf install android-tools`
    - Or place Google's [platform-tools](https://developer.android.com/tools/releases/platform-tools) folder next to the script as `platform-tools/`.
 2. Open a terminal in the extracted folder and run:
    ```bash
@@ -71,24 +70,23 @@ Every release is **dual-boot ready** without touching DariaOS stock `preloader` 
 - **Slot B:** Linux Mobile — currently **Ubuntu Touch** (and ready for future Sailfish OS / Droidian builds)
 - **`super.img`:** Mirrors `vendor`, `vendor_dlkm`, `odm_dlkm`, and `system_dlkm` to Slot B so Linux Mobile boots natively.
 
-### 1. One-time GPT partitioning (in Recovery)
+### 1. One-time GPT partitioning (no custom recovery needed)
 
 > [!CAUTION]
-> Resizing `userdata` wipes Android data. Back up your files and GPT table first.
+> Shrinking `userdata` wipes Android data. Back up your files first.
 
-1. Boot into custom recovery (TWRP) and back up the GPT table:
-   ```bash
-   adb shell sgdisk --backup=/sdcard/gpt_backup.bin /dev/block/sda
-   adb pull /sdcard/gpt_backup.bin
-   ```
-2. Check the last partition (`userdata`) in `adb shell`:
-   ```bash
-   sgdisk --print /dev/block/sda | tail -n 10
-   ```
-3. Shrink `userdata` by at least **40 GiB** and create two GPT partitions at the end of `/dev/block/sda` (type `8300`):
-   - `linux_system` — **10 GiB** (`10368709120` bytes)
-   - `linux_data` — **remaining space** (30+ GiB recommended)
-4. Format Android `userdata` in recovery, then reboot to bootloader (`fastboot`).
+`prepare_gpt.sh` (with its helper `gpt_edit.py`; both are included in the Ubuntu Touch zip and in `flash/`) does the whole job from your PC while Android is running:
+
+- **Requirements:** root (Magisk/KernelSU) granted to the adb shell, USB debugging on, and `adb`, `fastboot` and `python3` on the PC.
+**asks how many GiB you want to give Linux** (default 40, minimum about 40, and Android always keeps at least 20 GiB), shrinks `userdata` by that amount and creates `linux_system` (about 9.7 GiB) and `linux_data` (the rest) right after it. Partitions that follow `userdata` (like `flashinfo`) stay where they are. Only the partition entries and CRCs are edited; everything else in the vendor's GPT is left untouched.
+- The result is verified (automatic rollback on any mismatch), then the phone reboots to the bootloader and `userdata`/`metadata` are wiped. The backup and patch files are kept in `gpt_backup_<date>/` on the PC.
+
+```bash
+bash prepare_gpt.sh --dry-run             # show the plan only, change nothing
+bash prepare_gpt.sh                       # interactive: asks how many GiB to give Linux, then asks for YES
+bash prepare_gpt.sh --linux-gib 64        # non-interactive: 64 GiB in total for Linux
+bash prepare_gpt.sh --restore gpt_backup_<date>   # undo: restore the original table
+```
 
 ### 2. Flash Ubuntu Touch (Slot B)
 
@@ -115,9 +113,3 @@ Every release is **dual-boot ready** without touching DariaOS stock `preloader` 
 ### Updating VollaOS with Dual-Boot
 
 Flashing a new VollaOS release (`flash_all`) updates Slot A & B firmware and `super.img`. Afterwards, re-run `flash_ut_slot_b` with **`WIPE_DATA=NO`** to restore Ubuntu Touch on Slot B without losing data.
-
-## Repository layout
-
-- `flash/` – `commands.txt`, `flash_all.sh`, `flash_all.bat` (copied into every release package)
-- `prebuilt/` – `lk`, `preloader`, `vbmeta-disabled` (from DariaOS)
-- `.github/workflows/ota-checker.yml` – daily OTA check, repack, dual-boot build, and release

@@ -185,7 +185,7 @@ jobs:
 
           # 1. Compile universal static ARM64 A/B slot switcher (CRC32-verified AOSP bootloader_control)
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu zip
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross linux-libc-dev-arm64-cross zip
 
           cat << 'CEOF' > dualboot_artifacts/switch_slot.c
           #define _GNU_SOURCE

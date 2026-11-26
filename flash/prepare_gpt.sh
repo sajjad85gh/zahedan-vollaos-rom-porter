@@ -12,7 +12,7 @@
 #   5. reboots to the bootloader and wipes userdata/metadata (the old filesystem no longer fits)
 #
 # Usage:
-#   bash prepare_gpt.sh [--dry-run] [--linux-gib N]
+#   bash prepare_gpt.sh [--dry-run] [--linux-gib N] [--backup | --no-backup]
 #   bash prepare_gpt.sh --restore <backup_dir>
 #
 # Requirements: adb, fastboot and python3 on the PC, USB debugging enabled, root on the phone.
@@ -35,6 +35,7 @@ REMOTE_TMP=/data/local/tmp
 DUMP_BLOCKS=256                    # 256 * 4096 = 1 MiB dumped from each end of the disk
 
 DRY_RUN=0
+BACKUP_CHOICE=""                    # yes|no; asked interactively if unset (prepare_gpt.bat asks and passes --backup/--no-backup)
 RESTORE_DIR=""
 DISK=""
 LINK_PNUM=""
@@ -49,6 +50,8 @@ rsh() { adb shell "su -c '$*'" </dev/null | tr -d '\r'; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)    DRY_RUN=1 ;;
+    --backup)     BACKUP_CHOICE=yes ;;
+    --no-backup)  BACKUP_CHOICE=no ;;
     --linux-gib|--shrink-gib) LINUX_GIB=${2:?$1 needs a value}; shift ;;
     --restore)    RESTORE_DIR=${2:?--restore needs a backup directory}; shift ;;
     -h|--help)    sed -n '2,19p' "$0"; exit 0 ;;
@@ -67,7 +70,32 @@ find_python() {
       return
     fi
   done
-  die "Python 3 not found in PATH."
+  die "Python 3 not found in PATH. On Windows install it from https://www.python.org/downloads/ (tick 'Add python.exe to PATH') or run: winget install Python.Python.3.12 , then start this script again."
+}
+
+# Wait up to 90 s for an authorized adb device and tell the user what to do (firewall, RSA prompt, cable...).
+wait_for_adb() {
+  local st="" i
+  info "Starting the adb server (if Windows asks to allow adb through the firewall, click 'Allow')..."
+  # Not silenced on purpose: the first start of the adb daemon can hang behind a Windows Firewall prompt.
+  adb start-server </dev/null 2>&1 | tr -d '\r' || true
+  for i in $(seq 90); do
+    # A device line is "<serial><TAB><state>"; daemon messages ("* daemon started ...") are ignored.
+    st=$(adb devices </dev/null 2>/dev/null | tr -d '\r' | awk -F'\t' 'NF>=2 && $1 !~ /^\*/ { print $2; exit }')
+    case "$st" in
+      device) info "adb device found."; return 0 ;;
+      unauthorized)
+        if [ $(( (i - 1) % 15 )) -eq 0 ]; then info "Unlock the phone and tap Allow on the 'Allow USB debugging?' prompt (tick 'Always allow')..."; fi ;;
+      offline)
+        if [ $(( (i - 1) % 15 )) -eq 0 ]; then info "The phone is 'offline': unplug and re-plug the cable, or toggle USB debugging off and on..."; fi
+        [ "$i" -eq 30 ] && adb kill-server >/dev/null 2>&1 && adb start-server >/dev/null 2>&1 || true ;;
+      *)
+        if [ $(( (i - 1) % 15 )) -eq 0 ]; then info "Waiting for the phone: boot Android, enable USB debugging and connect the cable (try another port; on Windows also check the firewall prompt)..."; fi
+        if [ "$i" -eq 45 ]; then adb kill-server >/dev/null 2>&1 || true; adb start-server >/dev/null 2>&1 || true; fi ;;
+    esac
+    sleep 1
+  done
+  die "No authorized adb device (state: ${st:-none}). Boot Android, enable USB debugging, accept the prompt on the phone, and check that 'adb devices' lists the phone as 'device'."
 }
 
 require_tools() {
@@ -75,8 +103,7 @@ require_tools() {
   command -v fastboot >/dev/null || die "fastboot not found in PATH."
   find_python
   [ -f "$GPT_PY" ]               || die "gpt_edit.py must be next to this script."
-  [ "$(adb get-state 2>/dev/null || true)" = "device" ] \
-    || die "No authorized adb device. Boot Android and enable USB debugging."
+  wait_for_adb
   [ "$(rsh id -u || true)" = "0" ] \
     || die "Root is required. Grant su access to the adb shell (Magisk/KernelSU)."
 }
@@ -149,11 +176,12 @@ fb_ready() {
 }
 
 # Prints the size in bytes of a partition as seen by the bootloader (empty if unknown).
+# fastboot reports partition-size as hex, usually WITHOUT a 0x prefix (e.g. "26a800000").
 fb_size() {
   local out v
   out=$(fastboot getvar "partition-size:$1" 2>&1 || true)
-  v=$(sed -nE "s/.*partition-size:$1: *(0x[0-9a-fA-F]+|[0-9]+).*/\1/p" <<<"$out" | head -n1 || true)
-  if [ -n "$v" ]; then echo $(( v )); fi
+  v=$(sed -nE "s/.*partition-size:$1: *(0[xX])?([0-9a-fA-F]+).*/\\2/p" <<<"$out" | head -n1 || true)
+  if [ -n "$v" ]; then echo $(( 16#$v )); fi
 }
 
 reboot_and_wipe() {
@@ -246,12 +274,33 @@ fi
 confirm "This ERASES ALL ANDROID DATA (userdata is shrunk and wiped). Back up your files first."
 
 # ---------------------------------------------------------------- backup + apply
-BK=${BACKUP_DIR:-./gpt_backup_$(date +%Y%m%d-%H%M%S)}
+# Ask before saving the backup. The data needed for the automatic rollback is always created;
+# if the user declines, it lives in a temporary folder that is removed after a successful run.
+KEEP_BACKUP=1
+[ "$BACKUP_CHOICE" != "no" ] || KEEP_BACKUP=0
+if [ -z "$BACKUP_CHOICE" ] && [ -t 0 ] && [ -z "${BACKUP_DIR:-}" ]; then
+  echo
+  echo "A backup of the original partition table (head/tail of the disk + undo patches) can be saved"
+  echo "in ./gpt_backup_<date>-<time>/ . It is the only way to undo the change later (--restore)."
+  read -r -p "Save the backup? Type YES to save, NO to skip [YES]: " ans
+  case "${ans:-YES}" in
+    n|N|no|NO|No) KEEP_BACKUP=0 ;;
+  esac
+fi
+if [ "$KEEP_BACKUP" -eq 1 ]; then
+  BK=${BACKUP_DIR:-./gpt_backup_$(date +%Y%m%d-%H%M%S)}
+else
+  BK=$(mktemp -d "$HERE/.gpt_undo.XXXXXX")
+  info "Backup skipped: you will NOT be able to restore the original partition table later."
+fi
 mkdir -p "$BK"
 printf 'DISK=%s\nSSZ=%s\nTOTAL_SECTORS=%s\n' "$DISK" "$SSZ" "$TOTAL_SECTORS" > "$BK/disk.env"
 cp -r "$WORK/before" "$BK/before"
 gpt_cmd plan "$BK/before" "${PLAN_ARGS[@]}" --out "$BK/plan" >/dev/null || die "Could not create the patch files."
-info "Backup and patch files are in $BK (keep them until the dual-boot setup works)."
+if [ "$KEEP_BACKUP" -eq 1 ]; then
+  info "Backup and patch files are in $BK (keep them until the dual-boot setup works)."
+  info "To undo later: bash prepare_gpt.sh --restore ${BK#./}"
+fi
 
 rollback() {
   echo "[ERROR] $1" >&2
@@ -280,6 +329,8 @@ DATA_BL=$(fb_size linux_data)
 if [ -z "$SYS_BL" ] || [ -z "$DATA_BL" ] || [ "$SYS_BL" -lt "$LINUX_SYSTEM_BYTES" ]; then
   die "The bootloader does not report linux_system/linux_data as expected. Do not flash anything; check 'fastboot getvar all'."
 fi
+
+[ "$KEEP_BACKUP" -eq 1 ] || rm -rf "$BK"
 
 echo
 info "Done. The bootloader sees linux_system ($SYS_BL bytes) and linux_data ($DATA_BL bytes)."

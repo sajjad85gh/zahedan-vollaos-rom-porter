@@ -20,7 +20,22 @@ if not defined BASH (
 
 if exist "%~dp0platform-tools\adb.exe" set "PATH=%~dp0platform-tools;%PATH%"
 
-"%BASH%" "%~dp0prepare_gpt.sh" %*
+echo Starting adb server. If Windows asks to allow adb through the firewall, click "Allow".
+adb start-server
+adb devices
+echo.
+
+set "BKARG="
+if not "%~1"=="" goto :runsh
+echo Before anything is changed, a backup of the original partition table can be saved in
+echo a folder named gpt_backup_^<date^>-^<time^> next to this file. It is the only way to undo
+echo the change later ^(prepare_gpt.bat --restore gpt_backup_...^).
+set "BKANS="
+set /p "BKANS=Save the backup? Type YES to save, NO to skip [YES]: "
+set "BKARG=--backup"
+if /i "%BKANS%"=="NO" set "BKARG=--no-backup"
+:runsh
+"%BASH%" "%~dp0prepare_gpt.sh" %BKARG% %*
 set "RC=%ERRORLEVEL%"
 echo.
 if not "%RC%"=="0" echo prepare_gpt finished with errors ^(code %RC%^). Read the messages above. Do NOT boot Android if it says so.

@@ -36,7 +36,7 @@ Nothing to install: the latest `platform-tools` is bundled in the `platform-tool
 1. Open the extracted folder (keep the `platform-tools` folder next to the scripts and images).
 2. Double-click **`flash_all.bat`**.
 3. Type `YES` and press Enter.
-4. Wait until it says **DONE**. The phone reboots to recovery by itself.
+4. Wait until it says **DONE**. The script wipes `frp` (`fastboot erase frp`), sets Slot A active and reboots the phone to recovery by itself.
 
 If something goes wrong, the window **stays open** and shows the error. Don't close it before reading it, and don't reboot into the system.
 If the script waits forever on *"Waiting for a device in fastboot mode..."*, install the Google USB Driver or MediaTek USB driver from Device Manager.
@@ -77,19 +77,38 @@ Every release is **dual-boot ready** without touching DariaOS stock `preloader` 
 
 `prepare_gpt.sh` (with its helper `gpt_edit.py`; both are included in the Ubuntu Touch zip and in `flash/`) does the whole job from your PC while Android is running:
 
-- **Requirements:** root (Magisk/KernelSU) granted to the adb shell, USB debugging on, and `adb`, `fastboot` and `python3` on the PC.
- **Git for Windows** and **Python 3**, then double-click **`prepare_gpt.bat`** (it uses the bundled `platform-tools`; WSL can't see the phone over USB).
+- **Requirements:** root (Magisk/KernelSU) granted to the adb shell, USB debugging on, and `adb`, `fastboot` and `python3` on the PC. Nothing but `dd` is used on the phone. On Windows install **Git for Windows** and **Python 3**, then double-click **`prepare_gpt.bat`** (it uses the bundled `platform-tools`; WSL can't see the phone over USB).
 - It finds the disk that holds `userdata` by itself (the disk name differs between devices: on the Daria Bond it is `sdc`, not `sda`), dumps the GPT sectors, **asks how many GiB you want to give Linux** (default 40, minimum about 40, and Android always keeps at least 20 GiB), shrinks `userdata` by that amount and creates `linux_system` (about 9.7 GiB) and `linux_data` (the rest) right after it. Partitions that follow `userdata` (like `flashinfo`) stay where they are. Only the partition entries and CRCs are edited; everything else in the vendor's GPT is left untouched.
 - The result is verified (automatic rollback on any mismatch), then the phone reboots to the bootloader and `userdata`/`metadata` are wiped. The backup and patch files are kept in `gpt_backup_<date>/` on the PC.
 
 ```bash
-bash prepare_gpt.sh --dry-run                     # show the plan only, change nothing
+bash prepare_gpt.sh
+```
+Details:
+```bash
 bash prepare_gpt.sh                               # interactive: asks how many GiB to give Linux, then asks for YES
+bash prepare_gpt.sh --dry-run                     # show the plan only, change nothing
 bash prepare_gpt.sh --linux-gib 64                # non-interactive: 64 GiB in total for Linux
 bash prepare_gpt.sh --restore gpt_backup_<date>   # undo: restore the original table
 ```
 
 On Windows run the same options through `prepare_gpt.bat`, e.g. `prepare_gpt.bat --dry-run`.
+
+**Backup:** before changing anything the script asks *"Save the backup? Type YES to save, NO to skip"*. Answer `YES` (the default) to keep the original partition table in a folder named `gpt_backup_<YYYYMMDD>-<HHMMSS>` next to the script. If you answer `NO` the original table can **not** be restored later.
+
+**Restoring the backup (undo):** use the exact folder name that was created. For example, a backup made on 27 Nov 2026 at 03:15:42 is in `gpt_backup_20261127-031542`:
+
+```bash
+bash prepare_gpt.sh --restore gpt_backup_20261127-031542
+```
+
+On Windows:
+
+```bat
+prepare_gpt.bat --restore gpt_backup_20261127-031542
+```
+
+Type `YES` when asked. The original table is written back, verified, and `userdata`/`metadata` are wiped again (Android data is lost once more). Boot Android afterwards; it formats `userdata` on first start.
 
 ### 2. Flash Ubuntu Touch (Slot B)
 
@@ -103,8 +122,8 @@ On Windows run the same options through `prepare_gpt.bat`, e.g. `prepare_gpt.bat
 
 ### 3. Switching between VollaOS and Ubuntu Touch
 
-- **VollaOS → Ubuntu Touch:** Tap **Switch to Linux** in the app drawer or Quick Settings tile *(requires root — KernelSU/Magisk)*.
-- **Ubuntu Touch → VollaOS:** Tap **Switch to VollaOS** in the Lomiri app drawer *(works out of the box, no setup needed)*.
+- **VollaOS → Ubuntu Touch:** Tap **Switch to Linux** in the app drawer, or **tap the Quick Settings tile twice** (first tap: *Tap again to confirm*, second tap: switch + reboot; no dialog, so the notification shade is left alone) *(requires root — KernelSU/Magisk)*.
+- **Ubuntu Touch → VollaOS:** Tap **Reboot to Android** in the Lomiri app drawer and confirm *(works out of the box, no setup needed)*.
 - **Without root / Emergency fallback:**
   - **Recovery:** *Reboot → Slot A* (VollaOS) or *Slot B* (Ubuntu Touch)
   - **Fastboot:**
@@ -115,4 +134,4 @@ On Windows run the same options through `prepare_gpt.bat`, e.g. `prepare_gpt.bat
 
 ### Updating VollaOS with Dual-Boot
 
-Flashing a new VollaOS release (`flash_all`) updates Slot A & B firmware and `super.img`. Afterwards, re-run `flash_ut_slot_b` with **`WIPE_DATA=NO`** to restore Ubuntu Touch on Slot B without losing data.
+Flashing a new VollaOS release (`flash_all`) updates Slot A & B firmware and `super.img`. Afterwards, re-run `flash_ut_slot_b` and answer **`NO`** to *Format 'linux_data'?* to restore Ubuntu Touch on Slot B without losing data. The installer finishes with `fastboot reboot recovery`.

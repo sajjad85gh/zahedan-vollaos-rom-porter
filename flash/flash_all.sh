@@ -103,6 +103,8 @@ run flash --slot=all vbmeta vbmeta-disabled.img
 run flash --slot=all vbmeta_system vbmeta-disabled.img
 run flash --slot=all vbmeta_vendor vbmeta-disabled.img
 
+run erase frp
+
 run --set-active=a
 run reboot recovery
 

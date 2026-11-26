@@ -25,5 +25,7 @@ fastboot flash --slot=all vbmeta vbmeta-disabled.img
 fastboot flash --slot=all vbmeta_system vbmeta-disabled.img
 fastboot flash --slot=all vbmeta_vendor vbmeta-disabled.img
 
+fastboot erase frp
+
 fastboot --set-active=a
 fastboot reboot recovery

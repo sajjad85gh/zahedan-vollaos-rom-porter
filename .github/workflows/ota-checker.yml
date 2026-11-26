@@ -366,6 +366,25 @@ jobs:
           [ -x "$BT_DIR/aapt2" ] && [ -f "$PLAT_JAR" ] || { echo "FATAL: Preinstalled Android SDK not found"; exit 1; }
 
           cd dualboot_artifacts/apk_build
+          mkdir -p res/values
+
+          # The launcher activity only hosts a dialog. Theme.Translucent.NoTitleBar paints the status bar
+          # solid black behind the dialog, so use a DeviceDefault theme with transparent system bars.
+          cat << 'XMLEOF' > res/values/styles.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="DialogHost" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <item name="android:windowIsTranslucent">true</item>
+                  <item name="android:windowBackground">@android:color/transparent</item>
+                  <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+                  <item name="android:statusBarColor">@android:color/transparent</item>
+                  <item name="android:navigationBarColor">@android:color/transparent</item>
+                  <item name="android:enforceStatusBarContrast">false</item>
+                  <item name="android:enforceNavigationBarContrast">false</item>
+                  <item name="android:windowAnimationStyle">@null</item>
+              </style>
+          </resources>
+          XMLEOF
 
           cat << 'XMLEOF' > AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
@@ -381,7 +400,7 @@ jobs:
                   <activity
                       android:name=".MainActivity"
                       android:exported="true"
-                      android:theme="@android:style/Theme.Translucent.NoTitleBar">
+                      android:theme="@style/DialogHost">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -391,7 +410,7 @@ jobs:
                       android:name=".SwitchTileService"
                       android:exported="true"
                       android:label="Switch to Linux"
-                      android:icon="@drawable/ic_switch_linux"
+                      android:icon="@drawable/ic_tile_switch"
                       android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
                       <intent-filter>
                           <action android:name="android.service.quicksettings.action.QS_TILE" />
@@ -416,14 +435,70 @@ jobs:
           </vector>
           XMLEOF
 
+          # Quick Settings tiles are tinted by the system (only the alpha channel is used), so the
+          # colored launcher icon would turn into a plain disc. This variant cuts the arrows out of
+          # the circle (evenOdd) so the tile shows the same icon as the app.
+          cat << 'XMLEOF' > res/drawable/ic_tile_switch.xml
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:fillType="evenOdd"
+                  android:pathData="M12,2C6.48,2 2,6.48 2,12s4.48,10 10,10 10,-4.48 10,-10S17.52,2 12,2zM6.99,11L3,15l3.99,4v-3H14v-2H6.99v-3zM21,9l-3.99,-4v3H10v2h7.01v3L21,9z"/>
+          </vector>
+          XMLEOF
+
+          cat << 'JAVAEOF' > src/org/zahedan/dualboot/SwitchHelper.java
+          package org.zahedan.dualboot;
+
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+
+          final class SwitchHelper {
+              private SwitchHelper() {}
+
+              // Falls back to a copy in /data/local/tmp when the exec bit of /system/bin/switch-slot was lost in the repack.
+              private static final String CMD =
+                  "B=/system/bin/switch-slot; "
+                  + "[ -x $B ] || { cp $B /data/local/tmp/switch-slot "
+                  + "&& chmod 755 /data/local/tmp/switch-slot "
+                  + "&& B=/data/local/tmp/switch-slot; }; "
+                  + "$B 1";
+
+              /** Switches to Slot B and reboots. Returns null on success, otherwise a message to show. */
+              static String run() {
+                  StringBuilder out = new StringBuilder();
+                  int code = -1;
+                  try {
+                      Process p = new ProcessBuilder("su", "-c", CMD).redirectErrorStream(true).start();
+                      try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                          String line;
+                          while ((line = br.readLine()) != null) {
+                              out.append(line).append("\n");
+                          }
+                      }
+                      code = p.waitFor();
+                  } catch (Exception e) {
+                      out.append(e.getMessage());
+                  }
+                  if (code == 0) return null;
+                  String details = out.toString().trim();
+                  return "One-tap switching from Android requires root (KernelSU/Magisk).\n\n"
+                      + "Without root, switch via Recovery (Reboot > Slot B) or Fastboot (fastboot set_active b).\n\n"
+                      + (details.isEmpty() ? "" : "Details: " + details);
+              }
+          }
+          JAVAEOF
+
           cat << 'JAVAEOF' > src/org/zahedan/dualboot/MainActivity.java
           package org.zahedan.dualboot;
 
           import android.app.Activity;
           import android.app.AlertDialog;
           import android.os.Bundle;
-          import java.io.BufferedReader;
-          import java.io.InputStreamReader;
 
           public class MainActivity extends Activity {
               @Override
@@ -441,31 +516,12 @@ jobs:
 
               private void triggerSwitch() {
                   new Thread(() -> {
-                      StringBuilder out = new StringBuilder();
-                      int code = -1;
-                      try {
-                          Process p = new ProcessBuilder("su", "-c", "/system/bin/switch-slot 1")
-                              .redirectErrorStream(true)
-                              .start();
-                          try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-                              String line;
-                              while ((line = br.readLine()) != null) {
-                                  out.append(line).append("\n");
-                              }
-                          }
-                          code = p.waitFor();
-                      } catch (Exception e) {
-                          out.append(e.getMessage());
-                      }
-                      final int exitCode = code;
-                      final String details = out.toString().trim();
+                      final String error = SwitchHelper.run();
                       runOnUiThread(() -> {
-                          if (exitCode != 0) {
+                          if (error != null) {
                               new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                                   .setTitle("Root Access Required")
-                                  .setMessage("One-tap switching from Android requires root (KernelSU/Magisk).\n\n"
-                                      + "Without root, switch via Recovery (Reboot > Slot B) or Fastboot (fastboot set_active b).\n\n"
-                                      + (details.isEmpty() ? "" : "Details: " + details))
+                                  .setMessage(error)
                                   .setPositiveButton("OK", (d, w) -> finish())
                                   .setOnCancelListener(d -> finish())
                                   .show();
@@ -481,31 +537,83 @@ jobs:
           cat << 'JAVAEOF' > src/org/zahedan/dualboot/SwitchTileService.java
           package org.zahedan.dualboot;
 
-          import android.app.PendingIntent;
-          import android.content.Intent;
+          import android.graphics.drawable.Icon;
+          import android.os.Handler;
+          import android.os.Looper;
           import android.service.quicksettings.Tile;
           import android.service.quicksettings.TileService;
+          import android.widget.Toast;
 
+          // Two-tap confirmation done inside the tile itself: the first tap arms the tile ("Tap again to
+          // confirm"), the second tap within a few seconds switches to Slot B and reboots. No dialog and
+          // no activity are started, so the notification shade / status bar is never collapsed, re-opened
+          // or covered by anything.
           public class SwitchTileService extends TileService {
+              private static final long CONFIRM_WINDOW_MS = 4000;
+
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private boolean armed = false;
+              private final Runnable disarm = () -> {
+                  armed = false;
+                  render(null);
+              };
+
               @Override
               public void onStartListening() {
                   super.onStartListening();
-                  Tile tile = getQsTile();
-                  if (tile != null) {
-                      tile.setState(Tile.STATE_INACTIVE);
-                      tile.setLabel("Switch to Linux");
-                      tile.updateTile();
-                  }
+                  handler.removeCallbacks(disarm);
+                  armed = false;
+                  render(null);
+              }
+
+              @Override
+              public void onStopListening() {
+                  handler.removeCallbacks(disarm);
+                  armed = false;
+                  super.onStopListening();
               }
 
               @Override
               public void onClick() {
                   super.onClick();
-                  Intent i = new Intent(this, MainActivity.class);
-                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                  PendingIntent pi = PendingIntent.getActivity(
-                      this, 0, i, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-                  startActivityAndCollapse(pi);
+                  if (isLocked()) {
+                      unlockAndRun(this::handleClick);
+                  } else {
+                      handleClick();
+                  }
+              }
+
+              private void handleClick() {
+                  handler.removeCallbacks(disarm);
+                  if (!armed) {
+                      armed = true;
+                      render("Tap again to confirm");
+                      handler.postDelayed(disarm, CONFIRM_WINDOW_MS);
+                      return;
+                  }
+                  armed = false;
+                  render("Switching...");
+                  new Thread(() -> {
+                      final String error = SwitchHelper.run();
+                      if (error != null) {
+                          handler.post(() -> {
+                              render(null);
+                              Toast.makeText(getApplicationContext(),
+                                  "Root access required (KernelSU/Magisk). Use Recovery or fastboot instead.",
+                                  Toast.LENGTH_LONG).show();
+                          });
+                      }
+                  }).start();
+              }
+
+              private void render(String subtitle) {
+                  Tile tile = getQsTile();
+                  if (tile == null) return;
+                  tile.setState(armed || subtitle != null ? Tile.STATE_ACTIVE : Tile.STATE_INACTIVE);
+                  tile.setLabel("Switch to Linux");
+                  tile.setSubtitle(subtitle);
+                  tile.setIcon(Icon.createWithResource(this, R.drawable.ic_tile_switch));
+                  tile.updateTile();
               }
           }
           JAVAEOF
@@ -682,6 +790,103 @@ jobs:
               -ipath '*/app/*multiboot*' -o \
               -ipath '*/priv-app/*abm*' \
             \) -prune -print -exec rm -rf {} + 2>/dev/null || true
+
+          # Second pass: the app folder may have any name, so also match by package name / app label.
+          # NOTE: this must not rely on the Android SDK (aapt2): the "Free disk space" step above deletes
+          # /usr/local/lib/android, so the old aapt2 based pass silently never ran. The scan below only
+          # needs python3 and looks into AndroidManifest.xml (package name) and resources.arsc (labels).
+          cat << 'PYEOF' > ../remove_bootmanager.py
+          import os
+          import shutil
+          import sys
+          import zipfile
+
+          PKG_PATTERNS = (b"bootmanager", b"multiboot", b"multi-boot", b"bootset")
+          LABEL_PATTERNS = (b"volla boot manager", b"multi-boot manager", b"multiboot manager")
+          PROTECTED_DIRS = {"settings", "settingsintelligence", "systemui", "framework-res", "volladialer", "launcher3", "launcher"}
+
+          def ascii_lower(data):
+              # Binary XML / arsc strings are UTF-8 or UTF-16LE; dropping NUL bytes turns both into plain ASCII.
+              return data.replace(b"\x00", b"").lower()
+
+          def classify(apk):
+              try:
+                  with zipfile.ZipFile(apk) as z:
+                      names = set(z.namelist())
+                      manifest = ascii_lower(z.read("AndroidManifest.xml")) if "AndroidManifest.xml" in names else b""
+                      arsc = ascii_lower(z.read("resources.arsc")) if "resources.arsc" in names else b""
+              except Exception as exc:
+                  print("  (cannot read %s: %s)" % (apk, exc))
+                  return None
+              for p in PKG_PATTERNS:
+                  if p in manifest:
+                      return "manifest contains '%s'" % p.decode()
+              for p in LABEL_PATTERNS:
+                  if p in arsc:
+                      return "label contains '%s'" % p.decode()
+              return None
+
+          def find_apks(roots):
+              for root in roots:
+                  for dirpath, _dirs, files in os.walk(root):
+                      parts = dirpath.replace("\\", "/").split("/")
+                      if "app" not in parts and "priv-app" not in parts:
+                          continue
+                      for f in files:
+                          if f.endswith(".apk"):
+                              yield os.path.join(dirpath, f)
+
+          def main():
+              mode = sys.argv[1]
+              roots = sys.argv[2:]
+              found = 0
+              for apk in find_apks(roots):
+                  parent = os.path.basename(os.path.dirname(apk)).lower()
+                  if parent in PROTECTED_DIRS:
+                      continue
+                  why = classify(apk)
+                  if not why:
+                      continue
+                  found += 1
+                  print("%s %s  (%s)" % ("MATCH" if mode == "check" else "Removing", apk, why))
+                  if mode == "remove":
+                      apk_dir = os.path.dirname(apk)
+                      if os.path.basename(apk_dir) in ("app", "priv-app"):
+                          os.remove(apk)
+                      else:
+                          shutil.rmtree(apk_dir)
+              if mode == "remove":
+                  # Leftover permission / sysconfig files of the removed apps are harmless but confusing.
+                  for root in roots:
+                      for dirpath, _dirs, files in os.walk(root):
+                          if "/etc/" not in dirpath.replace("\\", "/") + "/":
+                              continue
+                          for f in files:
+                              low = f.lower()
+                              if any(k in low for k in ("bootmanager", "multiboot", "multi-boot")):
+                                  p = os.path.join(dirpath, f)
+                                  print("Removing %s" % p)
+                                  os.remove(p)
+              print("%s: %d apk(s)" % (mode, found))
+              return found
+
+          if __name__ == "__main__":
+              sys.exit(0 if main() >= 0 else 1)
+          PYEOF
+          BM_ROOTS="EXTRACTED_IMAGES/extracted_system_ext EXTRACTED_IMAGES/extracted_system EXTRACTED_IMAGES/extracted_product"
+          # shellcheck disable=SC2086
+          sudo python3 -I ../remove_bootmanager.py remove $BM_ROOTS
+
+          echo "Verifying that no Boot Manager apk is left:"
+          # shellcheck disable=SC2086
+          left=$(sudo python3 -I ../remove_bootmanager.py check $BM_ROOTS | grep -c '^MATCH' || true)
+          if [ "${left:-0}" -ne 0 ]; then
+            echo "FATAL: Boot Manager apk(s) are still present"
+            exit 1
+          fi
+          echo "Apps/folders mentioning boot, volla or ubports (for debugging):"
+          sudo find $BM_ROOTS -type f -name '*.apk' \( -path '*/app/*' -o -path '*/priv-app/*' \) 2>/dev/null \
+            | grep -iE 'boot|volla|ubports|multi' || true
 
           # Inject universal /system/bin/switch-slot binary
           SYS_BIN="EXTRACTED_IMAGES/extracted_system/system/bin"
@@ -976,14 +1181,14 @@ jobs:
           curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/vendor_boot_ut.img "$UT_VENDOR_BOOT_URL"
           curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/system_ut_raw.img "$UT_SYSTEM_URL"
 
-          # 3. Ensure raw ext4, inject one-tap "Switch to VollaOS" icon & helper directly into UT rootfs
+          # 3. Ensure raw ext4, inject one-tap "Reboot to Android" icon & helper directly into UT rootfs
           if file ut_dualboot_package/system_ut_raw.img | grep -qi 'Android sparse'; then
             simg2img ut_dualboot_package/system_ut_raw.img ut_dualboot_package/system_ut_unsparse.img
             mv -f ut_dualboot_package/system_ut_unsparse.img ut_dualboot_package/system_ut_raw.img
           fi
 
           if file ut_dualboot_package/system_ut_raw.img | grep -qi 'ext[234]'; then
-            echo "Injecting one-tap 'Switch to VollaOS' launcher icon into Ubuntu Touch rootfs..."
+            echo "Injecting one-tap 'Reboot to Android' launcher icon into Ubuntu Touch rootfs..."
             if dumpe2fs -h ut_dualboot_package/system_ut_raw.img 2>/dev/null | grep -qi 'shared_blocks'; then
               e2fsck -E unshare_blocks -fy ut_dualboot_package/system_ut_raw.img || true
             fi
@@ -1003,8 +1208,71 @@ jobs:
             sudo install -d -m 0755 -o 0 -g 0 ut_mnt/usr/local/sbin ut_mnt/usr/local/bin ut_mnt/usr/share/applications ut_mnt/usr/share/icons ut_mnt/etc/sudoers.d
             sudo install -m 0755 -o 0 -g 0 dualboot_artifacts/switch-slot ut_mnt/usr/local/sbin/switch-slot
 
+            sudo install -d -m 0755 -o 0 -g 0 ut_mnt/usr/share/switch-to-vollaos
+            sudo tee ut_mnt/usr/share/switch-to-vollaos/confirm.qml > /dev/null << 'QMLEOF'
+          import QtQuick 2.4
+          import Lomiri.Components 1.3
+          import Lomiri.Components.Popups 1.3
+
+          MainView {
+              id: root
+              applicationName: "switch-to-vollaos"
+              width: units.gu(40)
+              height: units.gu(60)
+
+              Component {
+                  id: confirmDialog
+                  Dialog {
+                      id: dlg
+                      title: "Reboot to Android"
+                      text: "Switch the active boot slot to Slot A (VollaOS) and reboot now?"
+                      Button {
+                          text: "Cancel"
+                          onClicked: {
+                              console.log("SWITCH_CANCELLED")
+                              PopupUtils.close(dlg)
+                              Qt.quit()
+                          }
+                      }
+                      Button {
+                          text: "Reboot to Android"
+                          color: theme.palette.normal.positive
+                          onClicked: {
+                              console.log("SWITCH_CONFIRMED")
+                              PopupUtils.close(dlg)
+                              Qt.quit()
+                          }
+                      }
+                  }
+              }
+
+              Component.onCompleted: {
+                  PopupUtils.open(confirmDialog)
+                  console.log("SWITCH_READY")
+              }
+          }
+          QMLEOF
+            sudo chmod 0644 ut_mnt/usr/share/switch-to-vollaos/confirm.qml
+            sudo chown 0:0 ut_mnt/usr/share/switch-to-vollaos/confirm.qml
+
+            # Ask "Are you sure?" first. Only an explicit tap on "Reboot to Android" continues.
+            # If the dialog cannot be shown at all (no qmlscene / QML failed to load) the switch
+            # runs directly, as before. Older Ubuntu Touch uses Ubuntu.Components instead of Lomiri.
             sudo tee ut_mnt/usr/local/bin/switch-to-vollaos > /dev/null << 'SHEOF'
           #!/bin/sh
+          QML=/usr/share/switch-to-vollaos/confirm.qml
+          if command -v qmlscene >/dev/null 2>&1 && [ -f "$QML" ]; then
+            FILE=$QML
+            if ! ls -d /usr/lib/*/qt5/qml/Lomiri/Components >/dev/null 2>&1; then
+              FILE=/tmp/switch-to-vollaos-confirm.qml
+              sed 's/Lomiri/Ubuntu/g' "$QML" > "$FILE"
+            fi
+            OUT=$(qmlscene "$FILE" 2>&1) || true
+            case "$OUT" in
+              *SWITCH_CONFIRMED*) ;;
+              *SWITCH_READY*) exit 0 ;;
+            esac
+          fi
           exec sudo -n /usr/local/sbin/switch-slot 0 >>/tmp/switch-to-vollaos.log 2>&1
           SHEOF
             sudo chmod 0755 ut_mnt/usr/local/bin/switch-to-vollaos
@@ -1028,7 +1296,7 @@ jobs:
 
             sudo tee ut_mnt/usr/share/applications/switch-to-vollaos.desktop > /dev/null << 'DESKEOF'
           [Desktop Entry]
-          Name=Switch to VollaOS
+          Name=Reboot to Android
           Comment=Switch active boot slot to Slot A (VollaOS) and reboot
           Exec=/usr/local/bin/switch-to-vollaos
           Icon=/usr/share/icons/switch-to-vollaos.svg
@@ -1045,7 +1313,7 @@ jobs:
             sudo umount ut_mnt
             rmdir ut_mnt
             e2fsck -fy ut_dualboot_package/system_ut_raw.img || true
-            echo "Successfully baked 'Switch to VollaOS' icon into Ubuntu Touch rootfs."
+            echo "Successfully baked 'Reboot to Android' icon into Ubuntu Touch rootfs."
           else
             echo "WARNING: system_ut_raw.img is not ext4 ($(file -b ut_dualboot_package/system_ut_raw.img)); skipping rootfs icon injection."
           fi
@@ -1112,7 +1380,7 @@ jobs:
           echo "================================================================"
           echo "  Ubuntu Touch Dual-Boot Installer (Slot B) for Daria Bond"
           echo "  - Keeps VollaOS 16 untouched on Slot A"
-          echo "  - Includes built-in 'Switch to VollaOS' one-tap app icon"
+          echo "  - Includes built-in 'Reboot to Android' one-tap app icon"
           echo "  Prerequisite: GPT partitions 'linux_system' & 'linux_data' (run prepare_gpt.sh first)"
           echo "================================================================"
           read -r -p "Type YES to flash Ubuntu Touch to Slot B: " CONFIRM
@@ -1131,8 +1399,8 @@ jobs:
           fi
 
           "$FASTBOOT" set_active b
-          echo "Done! Rebooting into Ubuntu Touch (Slot B)..."
-          "$FASTBOOT" reboot
+          echo "Done! Rebooting to recovery (Slot B)..."
+          "$FASTBOOT" reboot recovery
           SHEOF
           chmod +x ut_dualboot_package/flash_ut_slot_b.sh
 
@@ -1146,7 +1414,7 @@ jobs:
           echo ================================================================
           echo   Ubuntu Touch Dual-Boot Installer (Slot B) for Daria Bond
           echo   - Keeps VollaOS 16 untouched on Slot A
-          echo   - Includes built-in 'Switch to VollaOS' one-tap app icon
+          echo   - Includes built-in 'Reboot to Android' one-tap app icon
           echo   Prerequisite: GPT partitions 'linux_system' ^& 'linux_data' ^(run prepare_gpt.sh first^)
           echo ================================================================
           set /p CONFIRM=Type YES to flash Ubuntu Touch to Slot B: 
@@ -1169,8 +1437,8 @@ jobs:
           )
 
           "%FASTBOOT%" set_active b || goto :err
-          echo DONE! Rebooting into Ubuntu Touch ^(Slot B^)...
-          "%FASTBOOT%" reboot
+          echo DONE! Rebooting to recovery ^(Slot B^)...
+          "%FASTBOOT%" reboot recovery
           pause
           exit /b 0
 
@@ -1213,7 +1481,7 @@ jobs:
             ## VollaOS ${{ steps.check.outputs.version }} (${{ steps.check.outputs.date_formatted }}) for Daria Bond (`zahedan`)
 
             * **Main ROM (`volla-algiz-stable.7z.*`):** VollaOS with DariaOS `preloader`/`lk`, dual-boot ready `super.img`, stock Updater & unsafe Multi-Boot removed, and built-in **Switch to Linux** app + Quick Settings tile.
-            * **Ubuntu Touch Add-on (`volla-algiz-ubuntu-touch-dualboot.zip`):** Ready-to-flash Slot B dual-boot package (`${{ steps.ut_dualboot.outputs.ut_version }}`) with built-in **Switch to VollaOS** app icon.
+            * **Ubuntu Touch Add-on (`volla-algiz-ubuntu-touch-dualboot.zip`):** Ready-to-flash Slot B dual-boot package (`${{ steps.ut_dualboot.outputs.ut_version }}`) with built-in **Reboot to Android** app icon.
 
             See the repository **`README.md`** for full installation, partitioning, and dual-boot instructions.
           files: |

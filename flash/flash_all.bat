@@ -89,6 +89,8 @@ call :run flash --slot=all vbmeta vbmeta-disabled.img || goto :fail
 call :run flash --slot=all vbmeta_system vbmeta-disabled.img || goto :fail
 call :run flash --slot=all vbmeta_vendor vbmeta-disabled.img || goto :fail
 
+call :run erase frp || goto :fail
+
 call :run --set-active=a || goto :fail
 call :run reboot recovery || goto :fail
 

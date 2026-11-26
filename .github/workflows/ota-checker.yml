@@ -1099,6 +1099,7 @@ jobs:
           rm -rf platform-tools
           cp -f flash/prepare_gpt.sh ut_dualboot_package/prepare_gpt.sh
           cp -f flash/gpt_edit.py ut_dualboot_package/gpt_edit.py
+          cp -f flash/prepare_gpt.bat ut_dualboot_package/prepare_gpt.bat
           chmod +x ut_dualboot_package/prepare_gpt.sh
 
           cat << 'SHEOF' > ut_dualboot_package/flash_ut_slot_b.sh

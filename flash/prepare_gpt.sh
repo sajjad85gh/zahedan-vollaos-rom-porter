@@ -21,7 +21,8 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
 
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# `pwd -W` gives a C:/... path in Git Bash (native adb.exe/python need it); plain `pwd` elsewhere.
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && { pwd -W 2>/dev/null || pwd; })
 GPT_PY=$HERE/gpt_edit.py
 
 LINUX_GIB=""                      # total space for Linux (linux_system + linux_data); asked interactively if unset
@@ -57,10 +58,22 @@ while [ $# -gt 0 ]; do
 done
 [ -z "$LINUX_GIB" ] || [[ $LINUX_GIB =~ ^[0-9]+$ ]] || die "--linux-gib must be an integer."
 
+# Pick a working Python 3 (on Windows "python3" is often a Microsoft Store stub that fails).
+find_python() {
+  local c
+  for c in python3 python py; do
+    if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+      PY=$c
+      return
+    fi
+  done
+  die "Python 3 not found in PATH."
+}
+
 require_tools() {
   command -v adb >/dev/null      || die "adb not found in PATH."
   command -v fastboot >/dev/null || die "fastboot not found in PATH."
-  command -v python3 >/dev/null  || die "python3 not found in PATH."
+  find_python
   [ -f "$GPT_PY" ]               || die "gpt_edit.py must be next to this script."
   [ "$(adb get-state 2>/dev/null || true)" = "device" ] \
     || die "No authorized adb device. Boot Android and enable USB debugging."
@@ -115,7 +128,7 @@ dump_disk() {
 gpt_cmd() {  # gpt_cmd <plan|verify> <dump_dir> [extra args...]
   local sub=$1 dir=$2
   shift 2
-  python3 "$GPT_PY" "$sub" --head "$dir/head.bin" --tail "$dir/tail.bin" \
+  "$PY" "$GPT_PY" "$sub" --head "$dir/head.bin" --tail "$dir/tail.bin" \
     --sector-size "$SSZ" --total-sectors "$TOTAL_SECTORS" "$@"
 }
 
@@ -175,7 +188,7 @@ if [ -n "$RESTORE_DIR" ]; then
   read_geometry
   confirm "This restores the original partition table on $DISK and wipes Android data."
   apply_patches "$RESTORE_DIR/plan/undo" || die "Writing the original partition table failed."
-  WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+  WORK=$(mktemp -d "$HERE/.gpt_work.XXXXXX"); trap 'rm -rf "$WORK"' EXIT
   dump_disk "$WORK"
   gpt_cmd verify "$WORK" --plan "$RESTORE_DIR/plan/plan.json" --state orig || die "Restored GPT did not verify."
   reboot_and_wipe
@@ -192,7 +205,7 @@ read_geometry
 bat=$(adb shell dumpsys battery </dev/null | tr -d '\r' | awk '/level:/ { print $2; exit }')
 [[ ${bat:-} =~ ^[0-9]+$ ]] && [ "$bat" -ge 40 ] || die "Battery level is unknown or below 40%. Charge the phone first."
 
-WORK=$(mktemp -d)
+WORK=$(mktemp -d "$HERE/.gpt_work.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 dump_disk "$WORK/before"
 

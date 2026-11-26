@@ -78,15 +78,18 @@ Every release is **dual-boot ready** without touching DariaOS stock `preloader` 
 `prepare_gpt.sh` (with its helper `gpt_edit.py`; both are included in the Ubuntu Touch zip and in `flash/`) does the whole job from your PC while Android is running:
 
 - **Requirements:** root (Magisk/KernelSU) granted to the adb shell, USB debugging on, and `adb`, `fastboot` and `python3` on the PC.
-**asks how many GiB you want to give Linux** (default 40, minimum about 40, and Android always keeps at least 20 GiB), shrinks `userdata` by that amount and creates `linux_system` (about 9.7 GiB) and `linux_data` (the rest) right after it. Partitions that follow `userdata` (like `flashinfo`) stay where they are. Only the partition entries and CRCs are edited; everything else in the vendor's GPT is left untouched.
+ **Git for Windows** and **Python 3**, then double-click **`prepare_gpt.bat`** (it uses the bundled `platform-tools`; WSL can't see the phone over USB).
+- It finds the disk that holds `userdata` by itself (the disk name differs between devices: on the Daria Bond it is `sdc`, not `sda`), dumps the GPT sectors, **asks how many GiB you want to give Linux** (default 40, minimum about 40, and Android always keeps at least 20 GiB), shrinks `userdata` by that amount and creates `linux_system` (about 9.7 GiB) and `linux_data` (the rest) right after it. Partitions that follow `userdata` (like `flashinfo`) stay where they are. Only the partition entries and CRCs are edited; everything else in the vendor's GPT is left untouched.
 - The result is verified (automatic rollback on any mismatch), then the phone reboots to the bootloader and `userdata`/`metadata` are wiped. The backup and patch files are kept in `gpt_backup_<date>/` on the PC.
 
 ```bash
-bash prepare_gpt.sh --dry-run             # show the plan only, change nothing
-bash prepare_gpt.sh                       # interactive: asks how many GiB to give Linux, then asks for YES
-bash prepare_gpt.sh --linux-gib 64        # non-interactive: 64 GiB in total for Linux
+bash prepare_gpt.sh --dry-run                     # show the plan only, change nothing
+bash prepare_gpt.sh                               # interactive: asks how many GiB to give Linux, then asks for YES
+bash prepare_gpt.sh --linux-gib 64                # non-interactive: 64 GiB in total for Linux
 bash prepare_gpt.sh --restore gpt_backup_<date>   # undo: restore the original table
 ```
+
+On Windows run the same options through `prepare_gpt.bat`, e.g. `prepare_gpt.bat --dry-run`.
 
 ### 2. Flash Ubuntu Touch (Slot B)
 

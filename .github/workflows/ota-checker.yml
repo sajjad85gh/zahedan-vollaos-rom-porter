@@ -177,6 +177,354 @@ jobs:
           FORCE_REBUILD: ${{ inputs.force_rebuild || 'false' }}
         run: python check_ota.py
 
+      - name: Build dual-boot slot switcher binary (ARM64) & Android APK
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p dualboot_artifacts/apk_build/res/drawable dualboot_artifacts/apk_build/src/org/zahedan/dualboot dualboot_artifacts/apk_build/classes dualboot_artifacts/apk_build/dex_out
+
+          # 1. Compile universal static ARM64 A/B slot switcher (CRC32-verified AOSP bootloader_control)
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu zip
+
+          cat << 'CEOF' > dualboot_artifacts/switch_slot.c
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/reboot.h>
+          #include <unistd.h>
+
+          #define BOOT_CTRL_OFFSET 2048
+          #define BOOT_CTRL_SIZE   32
+          #define BOOT_CTRL_MAGIC  0x42414342U
+
+          static uint32_t crc32_le(const uint8_t *buf, size_t len) {
+              uint32_t crc = 0xffffffffU;
+              for (size_t i = 0; i < len; i++) {
+                  crc ^= buf[i];
+                  for (int j = 0; j < 8; j++) {
+                      crc = (crc >> 1) ^ (0xedb88320U & -(crc & 1U));
+                  }
+              }
+              return ~crc;
+          }
+
+          static uint32_t read_le32(const uint8_t *p) {
+              return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                     ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+          }
+
+          static void write_le32(uint8_t *p, uint32_t v) {
+              p[0] = (uint8_t)(v & 0xffU);
+              p[1] = (uint8_t)((v >> 8) & 0xffU);
+              p[2] = (uint8_t)((v >> 16) & 0xffU);
+              p[3] = (uint8_t)((v >> 24) & 0xffU);
+          }
+
+          static int find_and_open_misc(int flags, const char **chosen_path, uint8_t out_buf[BOOT_CTRL_SIZE]) {
+              const char *candidates[] = {
+                  "/dev/block/by-name/para",
+                  "/dev/block/by-name/misc",
+                  "/dev/disk/by-partlabel/para",
+                  "/dev/disk/by-partlabel/misc",
+                  NULL
+              };
+              for (int i = 0; candidates[i] != NULL; i++) {
+                  int fd = open(candidates[i], flags);
+                  if (fd < 0) continue;
+                  uint8_t buf[BOOT_CTRL_SIZE];
+                  ssize_t n = pread(fd, buf, BOOT_CTRL_SIZE, BOOT_CTRL_OFFSET);
+                  if (n == BOOT_CTRL_SIZE) {
+                      uint32_t magic = read_le32(buf + 4);
+                      uint8_t ver = buf[8];
+                      uint8_t nb_slot = buf[9] & 0x07U;
+                      uint32_t stored_crc = read_le32(buf + 28);
+                      uint32_t calc_crc = crc32_le(buf, 28);
+                      if (magic == BOOT_CTRL_MAGIC && ver == 1 && nb_slot >= 2 && stored_crc == calc_crc) {
+                          memcpy(out_buf, buf, BOOT_CTRL_SIZE);
+                          *chosen_path = candidates[i];
+                          return fd;
+                      }
+                  }
+                  close(fd);
+              }
+              return -1;
+          }
+
+          static void print_status(const char *path, const uint8_t buf[BOOT_CTRL_SIZE]) {
+              printf("Partition: %s\n", path);
+              printf("Suffix: %.4s | Magic: 0x%08x | Version: %u | Slots: %u\n",
+                     (const char *)buf, read_le32(buf + 4), buf[8], buf[9] & 0x07U);
+              for (int s = 0; s < 2; s++) {
+                  uint8_t b0 = buf[12 + s * 2];
+                  uint8_t b1 = buf[12 + s * 2 + 1];
+                  printf("Slot %d (_%c): priority=%u tries=%u successful=%u corrupted=%u\n",
+                         s, s == 0 ? 'a' : 'b',
+                         b0 & 0x0fU, (b0 >> 4) & 0x07U, (b0 >> 7) & 0x01U, b1 & 0x01U);
+              }
+          }
+
+          static void do_reboot(void) {
+              sync();
+              if (access("/system/bin/svc", X_OK) == 0) {
+                  if (system("/system/bin/svc power reboot") == 0) return;
+              }
+              if (access("/bin/systemctl", X_OK) == 0) {
+                  if (system("/bin/systemctl reboot") == 0) return;
+              }
+              if (access("/usr/bin/systemctl", X_OK) == 0) {
+                  if (system("/usr/bin/systemctl reboot") == 0) return;
+              }
+              if (access("/sbin/reboot", X_OK) == 0) {
+                  if (system("/sbin/reboot") == 0) return;
+              }
+              if (access("/system/bin/reboot", X_OK) == 0) {
+                  if (system("/system/bin/reboot") == 0) return;
+              }
+              reboot(RB_AUTOBOOT);
+          }
+
+          int main(int argc, char **argv) {
+              if (argc < 2) {
+                  fprintf(stderr, "Usage: %s <0|1|--status> [--no-reboot]\n", argv[0]);
+                  return 2;
+              }
+              const char *path = NULL;
+              uint8_t buf[BOOT_CTRL_SIZE];
+
+              if (strcmp(argv[1], "--status") == 0) {
+                  int fd = find_and_open_misc(O_RDONLY, &path, buf);
+                  if (fd < 0) {
+                      fprintf(stderr, "ERROR: Valid AOSP bootloader_control (BCAB + CRC32) not found in para/misc.\n");
+                      return 1;
+                  }
+                  print_status(path, buf);
+                  close(fd);
+                  return 0;
+              }
+
+              int target = -1;
+              if (strcmp(argv[1], "0") == 0 || strcmp(argv[1], "a") == 0 || strcmp(argv[1], "_a") == 0) target = 0;
+              else if (strcmp(argv[1], "1") == 0 || strcmp(argv[1], "b") == 0 || strcmp(argv[1], "_b") == 0) target = 1;
+              else {
+                  fprintf(stderr, "ERROR: Invalid slot '%s' (use 0 or 1).\n", argv[1]);
+                  return 2;
+              }
+
+              int no_reboot = (argc >= 3 && strcmp(argv[2], "--no-reboot") == 0);
+              int fd = find_and_open_misc(O_RDWR | O_SYNC, &path, buf);
+              if (fd < 0) {
+                  fprintf(stderr, "ERROR: Cannot open/verify AOSP bootloader_control in para/misc (need root?).\n");
+                  return 1;
+              }
+
+              int other = 1 - target;
+              memcpy(buf, target == 0 ? "_a\0\0" : "_b\0\0", 4);
+
+              /* Set target slot highest priority (15), tries=7, successful=1 so Linux OS never rolls back */
+              buf[12 + target * 2] = (uint8_t)((1U << 7) | (7U << 4) | 15U);
+              buf[12 + target * 2 + 1] = 0U;
+
+              /* Keep other slot permanently bootable as secondary (priority=14) */
+              buf[12 + other * 2] = (uint8_t)((1U << 7) | (7U << 4) | 14U);
+              buf[12 + other * 2 + 1] = 0U;
+
+              write_le32(buf + 28, crc32_le(buf, 28));
+
+              if (pwrite(fd, buf, BOOT_CTRL_SIZE, BOOT_CTRL_OFFSET) != BOOT_CTRL_SIZE) {
+                  perror("ERROR: pwrite failed");
+                  close(fd);
+                  return 1;
+              }
+              fsync(fd);
+              close(fd);
+              sync();
+
+              printf("Active boot slot switched to %d (_%c) on %s.\n", target, target == 0 ? 'a' : 'b', path);
+              if (!no_reboot) {
+                  do_reboot();
+              }
+              return 0;
+          }
+          CEOF
+
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -static -o dualboot_artifacts/switch-slot dualboot_artifacts/switch_slot.c
+          aarch64-linux-gnu-strip dualboot_artifacts/switch-slot
+          file dualboot_artifacts/switch-slot
+          ls -lh dualboot_artifacts/switch-slot
+
+          # 2. Build SwitchToLinux.apk (Launcher Icon + Quick Settings Tile) using preinstalled Android SDK
+          ANDROID_SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          BT_DIR=$(ls -d "$ANDROID_SDK"/build-tools/* 2>/dev/null | sort -V | tail -n 1)
+          PLAT_JAR=$(ls "$ANDROID_SDK"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -n 1)
+          echo "Using build-tools: $BT_DIR"
+          echo "Using android.jar: $PLAT_JAR"
+          [ -x "$BT_DIR/aapt2" ] && [ -f "$PLAT_JAR" ] || { echo "FATAL: Preinstalled Android SDK not found"; exit 1; }
+
+          cd dualboot_artifacts/apk_build
+
+          cat << 'XMLEOF' > AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="org.zahedan.dualboot"
+              android:versionCode="1"
+              android:versionName="1.0">
+              <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
+              <application
+                  android:label="Switch to Linux"
+                  android:icon="@drawable/ic_switch_linux"
+                  android:allowBackup="false">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:theme="@android:style/Theme.Translucent.NoTitleBar">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".SwitchTileService"
+                      android:exported="true"
+                      android:label="Switch to Linux"
+                      android:icon="@drawable/ic_switch_linux"
+                      android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+                      <intent-filter>
+                          <action android:name="android.service.quicksettings.action.QS_TILE" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          XMLEOF
+
+          cat << 'XMLEOF' > res/drawable/ic_switch_linux.xml
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#E95420"
+                  android:pathData="M12,2C6.48,2 2,6.48 2,12s4.48,10 10,10 10,-4.48 10,-10S17.52,2 12,2z"/>
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M6.99,11L3,15l3.99,4v-3H14v-2H6.99v-3zM21,9l-3.99,-4v3H10v2h7.01v3L21,9z"/>
+          </vector>
+          XMLEOF
+
+          cat << 'JAVAEOF' > src/org/zahedan/dualboot/MainActivity.java
+          package org.zahedan.dualboot;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.os.Bundle;
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+
+          public class MainActivity extends Activity {
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                      .setTitle("Switch to Linux Mobile")
+                      .setMessage("Switch active boot slot to Slot B (Ubuntu Touch / Linux Mobile) and reboot now?")
+                      .setCancelable(true)
+                      .setNegativeButton("Cancel", (d, w) -> finish())
+                      .setOnCancelListener(d -> finish())
+                      .setPositiveButton("Reboot to Linux", (d, w) -> triggerSwitch())
+                      .show();
+              }
+
+              private void triggerSwitch() {
+                  new Thread(() -> {
+                      StringBuilder out = new StringBuilder();
+                      int code = -1;
+                      try {
+                          Process p = new ProcessBuilder("su", "-c", "/system/bin/switch-slot 1")
+                              .redirectErrorStream(true)
+                              .start();
+                          try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                              String line;
+                              while ((line = br.readLine()) != null) {
+                                  out.append(line).append("\n");
+                              }
+                          }
+                          code = p.waitFor();
+                      } catch (Exception e) {
+                          out.append(e.getMessage());
+                      }
+                      final int exitCode = code;
+                      final String details = out.toString().trim();
+                      runOnUiThread(() -> {
+                          if (exitCode != 0) {
+                              new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                                  .setTitle("Root Access Required")
+                                  .setMessage("One-tap switching from Android requires root (KernelSU/Magisk).\n\n"
+                                      + "Without root, switch via Recovery (Reboot > Slot B) or Fastboot (fastboot set_active b).\n\n"
+                                      + (details.isEmpty() ? "" : "Details: " + details))
+                                  .setPositiveButton("OK", (d, w) -> finish())
+                                  .setOnCancelListener(d -> finish())
+                                  .show();
+                          } else {
+                              finish();
+                          }
+                      });
+                  }).start();
+              }
+          }
+          JAVAEOF
+
+          cat << 'JAVAEOF' > src/org/zahedan/dualboot/SwitchTileService.java
+          package org.zahedan.dualboot;
+
+          import android.app.PendingIntent;
+          import android.content.Intent;
+          import android.service.quicksettings.Tile;
+          import android.service.quicksettings.TileService;
+
+          public class SwitchTileService extends TileService {
+              @Override
+              public void onStartListening() {
+                  super.onStartListening();
+                  Tile tile = getQsTile();
+                  if (tile != null) {
+                      tile.setState(Tile.STATE_INACTIVE);
+                      tile.setLabel("Switch to Linux");
+                      tile.updateTile();
+                  }
+              }
+
+              @Override
+              public void onClick() {
+                  super.onClick();
+                  Intent i = new Intent(this, MainActivity.class);
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  PendingIntent pi = PendingIntent.getActivity(
+                      this, 0, i, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  startActivityAndCollapse(pi);
+              }
+          }
+          JAVAEOF
+
+          "$BT_DIR/aapt2" compile --dir res -o compiled_res.zip
+          "$BT_DIR/aapt2" link -o app-unsigned.apk -I "$PLAT_JAR" --manifest AndroidManifest.xml compiled_res.zip --java src
+          javac -source 11 -target 11 -classpath "$PLAT_JAR" -d classes src/org/zahedan/dualboot/*.java
+          "$BT_DIR/d8" --min-api 29 --lib "$PLAT_JAR" --output dex_out $(find classes -name '*.class')
+          zip -j -0 app-unsigned.apk dex_out/classes.dex
+          "$BT_DIR/zipalign" -f -p 4 app-unsigned.apk app-aligned.apk
+          keytool -genkeypair -v -keystore release.jks -storepass android -keypass android \
+            -alias switch -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=ZahedanDualBoot"
+          "$BT_DIR/apksigner" sign --ks release.jks --ks-pass pass:android --key-pass pass:android \
+            --out ../SwitchToLinux.apk app-aligned.apk
+          "$BT_DIR/apksigner" verify ../SwitchToLinux.apk
+          cd ../..
+          rm -rf dualboot_artifacts/apk_build
+          ls -lh dualboot_artifacts/
+
       - name: Download OTA zip
         if: steps.check.outputs.new_update == 'true'
         run: |
@@ -252,7 +600,7 @@ jobs:
         if: steps.check.outputs.new_update == 'true'
         run: git clone --branch v4 --depth 1 https://github.com/ravindu644/Android_Image_Tools.git
 
-      - name: Patch props, remove stock Updater and unsafe Multi-Boot Manager
+      - name: Patch props, remove stock Updater/Multi-Boot, and inject Switch to Linux
         if: steps.check.outputs.new_update == 'true'
         run: |
           set -euo pipefail
@@ -335,8 +683,19 @@ jobs:
               -ipath '*/priv-app/*abm*' \
             \) -prune -print -exec rm -rf {} + 2>/dev/null || true
 
-          echo "Updater/MultiBoot dirs remaining (should be empty):"
-          sudo find EXTRACTED_IMAGES -type d \( -path '*/priv-app/Updater' -o -ipath '*/priv-app/*bootmanager*' -o -ipath '*/priv-app/*multiboot*' \) || true
+          # Inject universal /system/bin/switch-slot binary
+          SYS_BIN="EXTRACTED_IMAGES/extracted_system/system/bin"
+          [ -d "$SYS_BIN" ] || SYS_BIN="EXTRACTED_IMAGES/extracted_system/bin"
+          sudo install -m 0755 -o 0 -g 0 ../dualboot_artifacts/switch-slot "$SYS_BIN/switch-slot"
+          echo "Installed switch-slot -> $SYS_BIN/switch-slot"
+
+          # Inject preinstalled SwitchToLinux.apk (Launcher icon + Quick Settings tile)
+          APP_BASE="EXTRACTED_IMAGES/extracted_product/app"
+          [ -d "$APP_BASE" ] || APP_BASE="EXTRACTED_IMAGES/extracted_system/system/app"
+          [ -d "$APP_BASE" ] || APP_BASE="EXTRACTED_IMAGES/extracted_system/app"
+          sudo install -d -m 0755 -o 0 -g 0 "$APP_BASE/SwitchToLinux"
+          sudo install -m 0644 -o 0 -g 0 ../dualboot_artifacts/SwitchToLinux.apk "$APP_BASE/SwitchToLinux/SwitchToLinux.apk"
+          echo "Installed SwitchToLinux.apk -> $APP_BASE/SwitchToLinux/SwitchToLinux.apk"
 
           for part in system product system_ext; do
             meta="EXTRACTED_IMAGES/extracted_${part}/.repack_info/metadata.txt"
@@ -429,8 +788,6 @@ jobs:
 
           SUPER_SIZE=7516192768
           RESERVE=4194304
-          # Mirror HAL/kernel-module dynamic partitions into Slot B so any Halium Linux Mobile OS
-          # (Ubuntu Touch, Sailfish OS, Droidian) boots natively on Slot B via standard slotselect.
           SLOT_B_HAL_PARTS="odm_dlkm system_dlkm vendor vendor_dlkm"
 
           SLOT_A_USED=0
@@ -532,7 +889,6 @@ jobs:
             cp -f "prebuilt/${img}.img" "flash_package/${img}.img"
           done
 
-          # Partitions taken from the OTA payload (flashed to both slots)
           PAYLOAD_PARTS=(md1img spmfw pi_img dpm scp sspm mcupm cam_vpu1 cam_vpu2 cam_vpu3 gz tee boot dtbo init_boot vendor_boot)
 
           missing=0
@@ -557,11 +913,8 @@ jobs:
             exit 1
           fi
 
-          # Flash scripts + command list (single source of truth lives in flash/)
           cp -f flash/commands.txt flash/flash_all.sh flash/flash_all.bat flash_package/
           chmod +x flash_package/flash_all.sh
-
-          # Bundled Windows platform-tools (latest, downloaded above)
           cp -a platform-tools flash_package/platform-tools
 
           echo "Flash package contents:"
@@ -587,7 +940,7 @@ jobs:
 
       - name: Build separate Ubuntu Touch dual-boot add-on package (Slot B)
         id: ut_dualboot
-        if: steps.check.outputs.new_update == 'true' && (inputs.build_ut_dualboot == null || inputs.build_ut_dualboot == true)
+        if: steps.check.outputs.new_update == 'true' && inputs.build_ut_dualboot != false
         run: |
           set -euo pipefail
           mkdir -p ut_dualboot_package
@@ -623,17 +976,87 @@ jobs:
           curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/vendor_boot_ut.img "$UT_VENDOR_BOOT_URL"
           curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/system_ut_raw.img "$UT_SYSTEM_URL"
 
-          # 3. Convert raw system.img to Android sparse format for fast, reliable fastboot flashing & smaller zip
+          # 3. Ensure raw ext4, inject one-tap "Switch to VollaOS" icon & helper directly into UT rootfs
           if file ut_dualboot_package/system_ut_raw.img | grep -qi 'Android sparse'; then
-            mv -f ut_dualboot_package/system_ut_raw.img ut_dualboot_package/system_ut.img
-          else
-            echo "Converting raw Ubuntu Touch system.img to Android sparse image..."
-            img2simg ut_dualboot_package/system_ut_raw.img ut_dualboot_package/system_ut.img
-            rm -f ut_dualboot_package/system_ut_raw.img
+            simg2img ut_dualboot_package/system_ut_raw.img ut_dualboot_package/system_ut_unsparse.img
+            mv -f ut_dualboot_package/system_ut_unsparse.img ut_dualboot_package/system_ut_raw.img
           fi
+
+          if file ut_dualboot_package/system_ut_raw.img | grep -qi 'ext[234]'; then
+            echo "Injecting one-tap 'Switch to VollaOS' launcher icon into Ubuntu Touch rootfs..."
+            if dumpe2fs -h ut_dualboot_package/system_ut_raw.img 2>/dev/null | grep -qi 'shared_blocks'; then
+              e2fsck -E unshare_blocks -fy ut_dualboot_package/system_ut_raw.img || true
+            fi
+            e2fsck -fy ut_dualboot_package/system_ut_raw.img || true
+
+            # Add 16 MiB headroom if image is tightly packed (staying safely under 10368709120 bytes)
+            CUR_SZ=$(stat -c%s ut_dualboot_package/system_ut_raw.img)
+            MAX_UT_SZ=10368709120
+            if [ $((CUR_SZ + 16777216)) -le "$MAX_UT_SZ" ]; then
+              truncate -s +16M ut_dualboot_package/system_ut_raw.img
+              resize2fs ut_dualboot_package/system_ut_raw.img
+            fi
+
+            mkdir -p ut_mnt
+            sudo mount -o loop,rw ut_dualboot_package/system_ut_raw.img ut_mnt
+
+            sudo install -d -m 0755 -o 0 -g 0 ut_mnt/usr/local/sbin ut_mnt/usr/local/bin ut_mnt/usr/share/applications ut_mnt/usr/share/icons ut_mnt/etc/sudoers.d
+            sudo install -m 0755 -o 0 -g 0 dualboot_artifacts/switch-slot ut_mnt/usr/local/sbin/switch-slot
+
+            sudo tee ut_mnt/usr/local/bin/switch-to-vollaos > /dev/null << 'SHEOF'
+          #!/bin/sh
+          exec sudo -n /usr/local/sbin/switch-slot 0 >>/tmp/switch-to-vollaos.log 2>&1
+          SHEOF
+            sudo chmod 0755 ut_mnt/usr/local/bin/switch-to-vollaos
+            sudo chown 0:0 ut_mnt/usr/local/bin/switch-to-vollaos
+
+            sudo tee ut_mnt/etc/sudoers.d/99-dualboot-switch > /dev/null << 'SUDOEOF'
+          Defaults!/usr/local/sbin/switch-slot !requiretty
+          phablet ALL=(ALL) NOPASSWD: /usr/local/sbin/switch-slot 0
+          SUDOEOF
+            sudo chmod 0440 ut_mnt/etc/sudoers.d/99-dualboot-switch
+            sudo chown 0:0 ut_mnt/etc/sudoers.d/99-dualboot-switch
+
+            sudo tee ut_mnt/usr/share/icons/switch-to-vollaos.svg > /dev/null << 'SVGEOF'
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+            <circle cx="32" cy="32" r="30" fill="#1E88E5"/>
+            <path fill="#FFFFFF" d="M22 28l-10 10 10 10v-7h18v-6H22v-7zm20-12v7H24v6h18v7l10-10-10-10z"/>
+          </svg>
+          SVGEOF
+            sudo chmod 0644 ut_mnt/usr/share/icons/switch-to-vollaos.svg
+            sudo chown 0:0 ut_mnt/usr/share/icons/switch-to-vollaos.svg
+
+            sudo tee ut_mnt/usr/share/applications/switch-to-vollaos.desktop > /dev/null << 'DESKEOF'
+          [Desktop Entry]
+          Name=Switch to VollaOS
+          Comment=Switch active boot slot to Slot A (VollaOS) and reboot
+          Exec=/usr/local/bin/switch-to-vollaos
+          Icon=/usr/share/icons/switch-to-vollaos.svg
+          Terminal=false
+          Type=Application
+          NoDisplay=false
+          X-Ubuntu-Touch=true
+          X-Lomiri-Touch=true
+          DESKEOF
+            sudo chmod 0644 ut_mnt/usr/share/applications/switch-to-vollaos.desktop
+            sudo chown 0:0 ut_mnt/usr/share/applications/switch-to-vollaos.desktop
+
+            sudo sync
+            sudo umount ut_mnt
+            rmdir ut_mnt
+            e2fsck -fy ut_dualboot_package/system_ut_raw.img || true
+            echo "Successfully baked 'Switch to VollaOS' icon into Ubuntu Touch rootfs."
+          else
+            echo "WARNING: system_ut_raw.img is not ext4 ($(file -b ut_dualboot_package/system_ut_raw.img)); skipping rootfs icon injection."
+          fi
+
+          # 4. Convert raw system.img to Android sparse format for fast, reliable fastboot flashing & smaller zip
+          echo "Converting Ubuntu Touch system.img to Android sparse image..."
+          img2simg ut_dualboot_package/system_ut_raw.img ut_dualboot_package/system_ut.img
+          rm -f ut_dualboot_package/system_ut_raw.img
           ls -lh ut_dualboot_package/
 
-          # 4. Patch vendor_boot_ut.img v4 cmdline in-place (preserves v4 multi-fragment ramdisk & recovery)
+          # 5. Patch vendor_boot_ut.img v4 cmdline in-place (preserves v4 multi-fragment ramdisk & recovery)
           python3 - << 'PYEOF'
           import struct
           from pathlib import Path
@@ -671,7 +1094,7 @@ jobs:
           print("Patched  vendor_cmdline:", verify_cmd)
           PYEOF
 
-          # 5. Bundle Windows platform-tools and Dual-Boot helper scripts
+          # 6. Bundle Windows platform-tools and Dual-Boot flash scripts
           cp -a platform-tools ut_dualboot_package/platform-tools
           rm -rf platform-tools
 
@@ -685,7 +1108,7 @@ jobs:
           echo "================================================================"
           echo "  Ubuntu Touch Dual-Boot Installer (Slot B) for Daria Bond"
           echo "  - Keeps VollaOS 16 untouched on Slot A"
-          echo "  - NEVER touches preloader, lk, super, or Android userdata"
+          echo "  - Includes built-in 'Switch to VollaOS' one-tap app icon"
           echo "  Prerequisite: GPT partitions 'linux_system' (10G) & 'linux_data'"
           echo "================================================================"
           read -r -p "Type YES to flash Ubuntu Touch to Slot B: " CONFIRM
@@ -719,7 +1142,7 @@ jobs:
           echo ================================================================
           echo   Ubuntu Touch Dual-Boot Installer (Slot B) for Daria Bond
           echo   - Keeps VollaOS 16 untouched on Slot A
-          echo   - NEVER touches preloader, lk, super, or Android userdata
+          echo   - Includes built-in 'Switch to VollaOS' one-tap app icon
           echo   Prerequisite: GPT partitions 'linux_system' (10G) ^& 'linux_data'
           echo ================================================================
           set /p CONFIRM=Type YES to flash Ubuntu Touch to Slot B: 
@@ -754,65 +1177,7 @@ jobs:
           exit /b 1
           BATEOF
 
-          cat << 'SHEOF' > ut_dualboot_package/switch_to_linux.sh
-          #!/system/bin/sh
-          # Run with root (KernelSU/Magisk/Termux su) on VollaOS (Slot A) to boot Linux Mobile (Slot B)
-          bootctl set-active-boot-slot 1 && reboot
-          SHEOF
-          chmod +x ut_dualboot_package/switch_to_linux.sh
-
-          cat << 'SHEOF' > ut_dualboot_package/switch_to_android.sh
-          #!/bin/sh
-          # Run on Ubuntu Touch / Linux Mobile (Slot B) to boot VollaOS (Slot A)
-          sudo lxc-attach -n android -- bootctl set-active-boot-slot 0 && sudo reboot
-          SHEOF
-          chmod +x ut_dualboot_package/switch_to_android.sh
-
-          cat << 'DOCEOF' > ut_dualboot_package/README_DUALBOOT.txt
-          Daria Bond (zahedan) - Dual-Boot Guide (VollaOS 16 on Slot A + Linux Mobile on Slot B)
-          ======================================================================================
-
-          HOW IT WORKS:
-          - Keeps DariaOS stock preloader & lk untouched (NO hard-brick risk).
-          - VollaOS 16 lives on Slot A (boot_a / init_boot_a / vendor_boot_a).
-          - super.img mirrors vendor, vendor_dlkm, odm_dlkm, and system_dlkm into Slot B
-            so Ubuntu Touch (and future Sailfish OS / Droidian builds) run natively on Slot B.
-          - Linux rootfs & user data live on two dedicated GPT partitions at the end of UFS (sda):
-              1) linux_system : 10 GiB (10368709120 bytes / 10240 MiB)
-              2) linux_data   : Remaining space (recommended 30+ GiB)
-
-          STEP 1 — ONE-TIME PARTITIONING IN RECOVERY (TWRP):
-          * Back up all personal data first! Resizing userdata wipes Android data.
-          1. Boot recovery and open adb shell:
-               sgdisk --backup=/sdcard/gpt_backup.bin /dev/block/sda
-               adb pull /sdcard/gpt_backup.bin
-          2. Inspect the last partition (userdata) number and start/end sectors:
-               sgdisk --print /dev/block/sda | tail -n 10
-          3. Shrink userdata by at least 40 GiB and create two new partitions after it:
-               - Name: linux_system  | Size: 10 GiB  | Type: 8300 (Linux filesystem)
-               - Name: linux_data    | Size: rest    | Type: 8300 (Linux filesystem)
-          4. Format Android userdata in recovery and reboot to bootloader (fastboot).
-
-          STEP 2 — FLASH UBUNTU TOUCH TO SLOT B:
-          - Windows: Run flash_ut_slot_b.bat
-          - Linux/Mac: Run bash flash_ut_slot_b.sh
-          - Choose YES to erase linux_data on FIRST install (choose NO when updating later).
-
-          STEP 3 — SWITCHING BETWEEN VOLLAOS AND LINUX MOBILE:
-          - From Fastboot:
-              VollaOS (Slot A):      fastboot set_active a && fastboot reboot
-              Linux Mobile (Slot B): fastboot set_active b && fastboot reboot
-          - Directly from OS (no PC):
-              VollaOS -> Linux:  su -c "sh switch_to_linux.sh"
-              Linux -> VollaOS:  sh switch_to_android.sh
-
-          NOTE ON FUTURE VOLLAOS UPDATES:
-          If you later flash a new VollaOS release with flash_all.sh/.bat, it updates Slot A & B
-          firmware + super.img. Afterwards, re-run flash_ut_slot_b with WIPE_DATA=NO to restore
-          Ubuntu Touch boot images on Slot B without losing any Ubuntu Touch data.
-          DOCEOF
-
-          # 6. Package as a standalone .zip (fall back to split 7z only if > 1900 MiB for GitHub 2 GiB limit)
+          # 7. Package as a standalone .zip (fall back to split 7z only if > 1900 MiB for GitHub 2 GiB limit)
           cd ut_dualboot_package
           zip -6 -r ../volla-algiz-ubuntu-touch-dualboot.zip .
           cd ..
@@ -830,9 +1195,9 @@ jobs:
           ls -lh volla-algiz-ubuntu-touch-dualboot.*
           df -h /
 
-      - name: Clean up platform-tools if UT dual-boot was skipped
+      - name: Clean up temporary build artifacts
         if: steps.check.outputs.new_update == 'true'
-        run: rm -rf platform-tools
+        run: rm -rf platform-tools dualboot_artifacts
 
       - name: Create GitHub Release
         if: steps.check.outputs.new_update == 'true'
@@ -841,40 +1206,12 @@ jobs:
           tag_name: stable-${{ steps.check.outputs.version_date }}
           name: "Volla Algiz Stable ${{ steps.check.outputs.version_date }}"
           body: |
-            ## Download & Extract (VollaOS 16)
-            Download **all** `volla-algiz-stable.7z.*` parts into the **same folder**, then extract **only the `.001` file**, the rest are loaded automatically.
+            ## VollaOS ${{ steps.check.outputs.version }} (${{ steps.check.outputs.date_formatted }}) for Daria Bond (`zahedan`)
 
-            **Windows:** right-click `volla-algiz-stable.7z.001` → 7-Zip → Extract Here
-            **Linux/Mac:** `7z x volla-algiz-stable.7z.001`
+            * **Main ROM (`volla-algiz-stable.7z.*`):** VollaOS with DariaOS `preloader`/`lk`, dual-boot ready `super.img`, stock Updater & unsafe Multi-Boot removed, and built-in **Switch to Linux** app + Quick Settings tile.
+            * **Ubuntu Touch Add-on (`volla-algiz-ubuntu-touch-dualboot.zip`):** Ready-to-flash Slot B dual-boot package (`${{ steps.ut_dualboot.outputs.ut_version }}`) with built-in **Switch to VollaOS** app icon.
 
-            ## Flash (VollaOS 16)
-            First reboot the phone to the bootloader: `adb reboot bootloader` (or power off and hold Volume Down + Power).
-
-            ### Windows users
-            Nothing to install, the latest platform-tools is bundled in the `platform-tools` folder.
-            1. Open the extracted folder (don't move/delete the `platform-tools` folder).
-            2. Double-click **`flash_all.bat`**.
-            3. Type `YES` and press Enter, then wait for **DONE**.
-
-            If an error happens the window stays open and shows the error text. Don't reboot into the system until it's resolved.
-            If it keeps waiting for the device, check the cable/port and install the Google USB Driver or the MediaTek USB driver.
-
-            ### Linux / Mac users
-            1. Install `fastboot` (`sudo apt install fastboot` on Debian/Ubuntu, `sudo pacman -S android-tools` on Arch, `sudo dnf install android-tools` on Fedora), or put Google's platform-tools folder next to the script as `platform-tools/`.
-            2. Open a terminal in the extracted folder and run: `bash flash_all.sh`
-            3. Type `YES` and press Enter, then wait for **Done**.
-
-            The phone reboots to recovery when flashing finishes. The manual command list is in `commands.txt`.
-
-            ## Dual-Boot Add-on (Linux Mobile on Slot B)
-            This build is **Linux Mobile Dual-Boot Ready** out of the box (`super.img` mirrors `vendor`, `vendor_dlkm`, `odm_dlkm`, and `system_dlkm` to Slot B while keeping DariaOS `preloader` and `lk` untouched).
-
-            * Download **`volla-algiz-ubuntu-touch-dualboot.zip`** (Ubuntu Touch `${{ steps.ut_dualboot.outputs.ut_version }}`) from the assets below.
-            * Extract it and follow `README_DUALBOOT.txt` (create `linux_system` + `linux_data` GPT partitions once, then run `flash_ut_slot_b.bat` / `flash_ut_slot_b.sh`).
-            * Future Sailfish OS / Droidian builds can use the exact same `linux_system` + `linux_data` partitions on Slot B.
-
-            ## Notes
-            `lk` and `preloader` are taken from DariaOS (stock Volla Multi-Boot Manager is removed to prevent bricking Daria `lk`). `super.img` is the dual-boot ready repacked super. `vbmeta`, `vbmeta_system` and `vbmeta_vendor` are flashed from `vbmeta-disabled.img` — stock vbmeta will not boot builds.
+            See the repository **`README.md`** for full installation, partitioning, and dual-boot instructions.
           files: |
             volla-algiz-stable.7z.*
             volla-algiz-ubuntu-touch-dualboot.*
@@ -908,7 +1245,8 @@ jobs:
           <b>Updated: __DATE__</b>
 
           <blockquote>• Updater &amp; unsafe stock Multi-Boot removed
-          • Linux Mobile Dual-Boot ready (Slot B HAL included + separate Ubuntu Touch zip)
+          • Linux Mobile Dual-Boot ready + One-tap OS Switcher built-in
+          • Separate Ubuntu Touch Slot B zip included
           • Don’t use ADB sideload for updates!</blockquote>
 
           ×| <a href="__RELEASE_URL__">Download</a>

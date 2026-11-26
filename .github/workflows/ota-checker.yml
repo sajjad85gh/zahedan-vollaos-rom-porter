@@ -4,6 +4,17 @@ on:
   schedule:
     - cron: '0 12 * * *'
   workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild even if version matches last_version.txt'
+        required: false
+        default: false
+        type: boolean
+      build_ut_dualboot:
+        description: 'Build separate Ubuntu Touch dual-boot add-on zip (Slot B)'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -137,13 +148,14 @@ jobs:
               latest_version, latest_date, latest_url = updates[0]
               print(f"Found {len(updates)} stable update(s). Latest: v{latest_version} ({latest_date})")
 
+              force_rebuild = os.environ.get("FORCE_REBUILD", "false").lower() == "true"
               last_version = get_last_version()
-              if last_version and latest_date <= last_version:
+              if not force_rebuild and last_version and latest_date <= last_version:
                   print(f"Already processed version {last_version}. No new update.")
                   set_output("new_update", "false")
                   return 0
 
-              print(f"New update available: {latest_url}")
+              print(f"Building update: {latest_url} (force_rebuild={force_rebuild})")
               set_output("new_update", "true")
               set_output("download_url", latest_url)
               set_output("version", latest_version)
@@ -159,16 +171,17 @@ jobs:
               sys.exit(main())
           PYEOF
 
-
       - name: Check for new stable update
         id: check
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild || 'false' }}
         run: python check_ota.py
 
       - name: Download OTA zip
         if: steps.check.outputs.new_update == 'true'
         run: |
           echo "Downloading ${{ steps.check.outputs.download_url }} ..."
-          curl -L --retry 3 --retry-delay 10 -o ota.zip "${{ steps.check.outputs.download_url }}"
+          curl -fL --retry 3 --retry-delay 10 -o ota.zip "${{ steps.check.outputs.download_url }}"
           echo "Download size: $(du -h ota.zip | cut -f1)"
 
       - name: Dump OTA payload
@@ -214,7 +227,9 @@ jobs:
             attr \
             zlib1g-dev \
             rsync \
-            file
+            file \
+            p7zip-full \
+            zip
           sudo modprobe fuse || true
           sudo modprobe erofs || true
           if ! command -v mkfs.erofs >/dev/null || ! command -v erofsfuse >/dev/null; then
@@ -230,13 +245,14 @@ jobs:
           fi
           mkfs.erofs --help >/dev/null
           command -v simg2img
+          command -v img2simg
           df -h /
 
       - name: Clone Android Image Tools
         if: steps.check.outputs.new_update == 'true'
         run: git clone --branch v4 --depth 1 https://github.com/ravindu644/Android_Image_Tools.git
 
-      - name: Add name to settings and remove stock Updater
+      - name: Patch props, remove stock Updater and unsafe Multi-Boot Manager
         if: steps.check.outputs.new_update == 'true'
         run: |
           set -euo pipefail
@@ -307,10 +323,20 @@ jobs:
           echo "Patched version props:"
           sudo grep -R --include='*.prop' -nE 'ro\.(volla\.build|lineage)\.version=' EXTRACTED_IMAGES/extracted_system EXTRACTED_IMAGES/extracted_product || true
 
+          # Remove stock Updater and stock Volla Multi-Boot Manager (flashing Volla lk bricks Daria Bond)
+          echo "Removing stock Updater and stock Multi-Boot/BootManager apps:"
           sudo find EXTRACTED_IMAGES/extracted_system_ext EXTRACTED_IMAGES/extracted_system EXTRACTED_IMAGES/extracted_product \
-            -type d -path '*/priv-app/Updater' -prune -exec rm -rf {} + 2>/dev/null || true
-          echo "Updater dirs remaining (should be empty):"
-          sudo find EXTRACTED_IMAGES -type d -path '*/priv-app/Updater' || true
+            -type d \( \
+              -path '*/priv-app/Updater' -o \
+              -ipath '*/priv-app/*bootmanager*' -o \
+              -ipath '*/app/*bootmanager*' -o \
+              -ipath '*/priv-app/*multiboot*' -o \
+              -ipath '*/app/*multiboot*' -o \
+              -ipath '*/priv-app/*abm*' \
+            \) -prune -print -exec rm -rf {} + 2>/dev/null || true
+
+          echo "Updater/MultiBoot dirs remaining (should be empty):"
+          sudo find EXTRACTED_IMAGES -type d \( -path '*/priv-app/Updater' -o -ipath '*/priv-app/*bootmanager*' -o -ipath '*/priv-app/*multiboot*' \) || true
 
           for part in system product system_ext; do
             meta="EXTRACTED_IMAGES/extracted_${part}/.repack_info/metadata.txt"
@@ -381,40 +407,85 @@ jobs:
           df -h /
 
       - name: Install lpmake
+        if: steps.check.outputs.new_update == 'true'
         run: |
           curl -fL -o lpmake "https://raw.githubusercontent.com/Rprop/aosp15_partition_tools/main/linux_glibc_x86_64/lpmake"
           chmod +x lpmake
           ./lpmake --help || true
 
-      - name: Build super image
+      - name: Build dual-boot ready super image (Slot A Full + Slot B Linux HAL)
         if: steps.check.outputs.new_update == 'true'
         run: |
+          set -euo pipefail
           find_image() {
             for suffix in "_a" ""; do
-              [ -f "extracted/$1${suffix}.img" ] && { echo "extracted/$1${suffix}.img"; return; }
+              [ -f "extracted/$1${suffix}.img" ] && { echo "extracted/$1${suffix}.img"; return 0; }
             done
+            return 1
           }
+          align_up_4k() {
+            echo $(( (($1 + 4095) / 4096) * 4096 ))
+          }
+
           SUPER_SIZE=7516192768
           RESERVE=4194304
-          GROUP_A_SIZE=$((SUPER_SIZE - RESERVE))
-          GROUP_B_SIZE=$RESERVE
-          ARGS=""
-          ARGS="$ARGS --group mtk_dynamic_partitions_a:${GROUP_A_SIZE}"
-          ARGS="$ARGS --group mtk_dynamic_partitions_b:${GROUP_B_SIZE}"
+          # Mirror HAL/kernel-module dynamic partitions into Slot B so any Halium Linux Mobile OS
+          # (Ubuntu Touch, Sailfish OS, Droidian) boots natively on Slot B via standard slotselect.
+          SLOT_B_HAL_PARTS="odm_dlkm system_dlkm vendor vendor_dlkm"
+
+          SLOT_A_USED=0
+          SLOT_B_USED=0
+          declare -A PART_IMG PART_SIZE
+
           for p in odm_dlkm product system system_dlkm system_ext vendor vendor_dlkm; do
-            img=$(find_image "$p")
+            img=$(find_image "$p" || true)
+            if [ -n "$img" ]; then
+              sz=$(stat -c%s "$img")
+              PART_IMG[$p]="$img"
+              PART_SIZE[$p]="$sz"
+              SLOT_A_USED=$((SLOT_A_USED + $(align_up_4k "$sz")))
+              if [[ " $SLOT_B_HAL_PARTS " == *" $p "* ]]; then
+                SLOT_B_USED=$((SLOT_B_USED + $(align_up_4k "$sz")))
+              fi
+            fi
+          done
+
+          if [ "$SLOT_B_USED" -gt 0 ]; then
+            GROUP_B_SIZE=$((SLOT_B_USED + RESERVE))
+          else
+            GROUP_B_SIZE=$RESERVE
+          fi
+          GROUP_A_SIZE=$(( ((SUPER_SIZE - RESERVE - GROUP_B_SIZE) / 4096) * 4096 ))
+
+          echo "SUPER_SIZE=$SUPER_SIZE"
+          echo "SLOT_A_USED=$SLOT_A_USED (GROUP_A_SIZE=$GROUP_A_SIZE)"
+          echo "SLOT_B_USED=$SLOT_B_USED (GROUP_B_SIZE=$GROUP_B_SIZE)"
+
+          if [ "$SLOT_A_USED" -gt "$GROUP_A_SIZE" ] || [ "$((GROUP_A_SIZE + GROUP_B_SIZE))" -gt "$((SUPER_SIZE - RESERVE))" ]; then
+            echo "FATAL: Dynamic partitions exceed SUPER_SIZE with Slot B HAL mirroring enabled"
+            exit 1
+          fi
+
+          ARGS="--group mtk_dynamic_partitions_a:${GROUP_A_SIZE} --group mtk_dynamic_partitions_b:${GROUP_B_SIZE}"
+          for p in odm_dlkm product system system_dlkm system_ext vendor vendor_dlkm; do
+            img="${PART_IMG[$p]:-}"
+            sz="${PART_SIZE[$p]:-0}"
             if [ -z "$img" ]; then
               echo "WARNING: $p missing — emitting empty _a/_b entries"
               ARGS="$ARGS --partition ${p}_a:none:0:mtk_dynamic_partitions_a"
               ARGS="$ARGS --partition ${p}_b:none:0:mtk_dynamic_partitions_b"
               continue
             fi
-            size=$(stat -c%s "$img")
-            echo "Using $img ($size bytes) -> ${p}_a"
-            ARGS="$ARGS --partition ${p}_a:none:${size}:mtk_dynamic_partitions_a"
-            ARGS="$ARGS --image ${p}_a=${img}"
-            ARGS="$ARGS --partition ${p}_b:none:0:mtk_dynamic_partitions_b"
+            echo "Using $img ($sz bytes) -> ${p}_a"
+            ARGS="$ARGS --partition ${p}_a:none:${sz}:mtk_dynamic_partitions_a --image ${p}_a=${img}"
+            if [[ " $SLOT_B_HAL_PARTS " == *" $p "* ]]; then
+              echo "Mirroring $img ($sz bytes) -> ${p}_b (Linux Mobile Dual-Boot HAL)"
+              ARGS="$ARGS --partition ${p}_b:none:${sz}:mtk_dynamic_partitions_b --image ${p}_b=${img}"
+            else
+              ARGS="$ARGS --partition ${p}_b:none:0:mtk_dynamic_partitions_b"
+            fi
           done
+
           ./lpmake \
             --metadata-size 65536 \
             --metadata-slots 3 \
@@ -441,7 +512,7 @@ jobs:
           echo "platform-tools contents:"
           ls -lh platform-tools/ | head -n 30
 
-      - name: Prepare flash package
+      - name: Prepare main VollaOS flash package
         if: steps.check.outputs.new_update == 'true'
         run: |
           set -euo pipefail
@@ -495,27 +566,273 @@ jobs:
 
           echo "Flash package contents:"
           ls -lh flash_package/
-          echo "----- commands.txt -----"
-          cat flash_package/commands.txt
 
       - name: Free space - remove extracted partition images
         if: steps.check.outputs.new_update == 'true'
         run: |
-          rm -rf extracted super.img platform-tools
-          echo "Remaining workspace usage:"
-          du -h --max-depth=1 . | sort -h || true
+          rm -rf extracted super.img
           df -h /
 
-      - name: Compress and split for upload
+      - name: Compress and split main VollaOS package
         if: steps.check.outputs.new_update == 'true'
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
           cd flash_package
-          echo "Compressing with 7z multi-volume..."
+          echo "Compressing VollaOS flash package with 7z multi-volume..."
           7z a -v1900m -mx=6 ../volla-algiz-stable.7z *
           cd ..
+          rm -rf flash_package
           echo "Parts created:"
           ls -lh volla-algiz-stable.7z.*
+          df -h /
+
+      - name: Build separate Ubuntu Touch dual-boot add-on package (Slot B)
+        id: ut_dualboot
+        if: steps.check.outputs.new_update == 'true' && (inputs.build_ut_dualboot == null || inputs.build_ut_dualboot == true)
+        run: |
+          set -euo pipefail
+          mkdir -p ut_dualboot_package
+
+          # 1. Fetch latest algiz-a15 Ubuntu Touch URLs dynamically from Volla ABM server
+          python3 - << 'PYEOF' > ut_urls.env
+          import requests, sys
+
+          data = requests.get("https://abm.volla.tech/algiz-a15.json", timeout=60).json()
+          ut = next((o for o in data.get("oses", []) if o.get("rtype") == "UT"), None)
+          if not ut:
+              sys.exit("FATAL: Ubuntu Touch (rtype=UT) entry not found in algiz-a15.json")
+
+          inet = {item["id"]: item["url"] for item in ut.get("inet", [])}
+          for key in ("ut", "boot", "vendor_boot", "init_boot"):
+              if key not in inet:
+                  sys.exit(f"FATAL: Missing {key} URL in algiz-a15.json")
+
+          print(f'UT_VERSION="{ut.get("displayVersion", "unknown")}"')
+          print(f'UT_SYSTEM_URL="{inet["ut"]}"')
+          print(f'UT_BOOT_URL="{inet["boot"]}"')
+          print(f'UT_VENDOR_BOOT_URL="{inet["vendor_boot"]}"')
+          print(f'UT_INIT_BOOT_URL="{inet["init_boot"]}"')
+          PYEOF
+
+          cat ut_urls.env
+          source ut_urls.env
+          echo "ut_version=${UT_VERSION}" >> "$GITHUB_OUTPUT"
+
+          # 2. Download boot, init_boot, vendor_boot, and system.img
+          curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/boot_ut.img "$UT_BOOT_URL"
+          curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/init_boot_ut.img "$UT_INIT_BOOT_URL"
+          curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/vendor_boot_ut.img "$UT_VENDOR_BOOT_URL"
+          curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/system_ut_raw.img "$UT_SYSTEM_URL"
+
+          # 3. Convert raw system.img to Android sparse format for fast, reliable fastboot flashing & smaller zip
+          if file ut_dualboot_package/system_ut_raw.img | grep -qi 'Android sparse'; then
+            mv -f ut_dualboot_package/system_ut_raw.img ut_dualboot_package/system_ut.img
+          else
+            echo "Converting raw Ubuntu Touch system.img to Android sparse image..."
+            img2simg ut_dualboot_package/system_ut_raw.img ut_dualboot_package/system_ut.img
+            rm -f ut_dualboot_package/system_ut_raw.img
+          fi
+          ls -lh ut_dualboot_package/
+
+          # 4. Patch vendor_boot_ut.img v4 cmdline in-place (preserves v4 multi-fragment ramdisk & recovery)
+          python3 - << 'PYEOF'
+          import struct
+          from pathlib import Path
+
+          p = Path("ut_dualboot_package/vendor_boot_ut.img")
+          vb = bytearray(p.read_bytes())
+
+          if vb[:8] != b"VNDRBOOT":
+              raise SystemExit("FATAL: vendor_boot_ut.img does not start with VNDRBOOT")
+          hver = struct.unpack_from("<I", vb, 8)[0]
+          if hver < 3:
+              raise SystemExit(f"FATAL: unsupported vendor_boot header version: {hver}")
+          bc_sz = struct.unpack_from("<I", vb, 2124)[0] if hver >= 4 else 0
+          if bc_sz != 0:
+              raise SystemExit(f"FATAL: unexpected non-zero bootconfig_size={bc_sz}; inspect before patching")
+
+          old_cmd = bytes(vb[28:2076]).split(b"\x00", 1)[0].decode("ascii")
+          print("Original vendor_cmdline:", old_cmd)
+
+          tokens = [
+              t for t in old_cmd.split()
+              if not t.startswith(("systempart=", "datapart=", "ABM.bootloader="))
+          ]
+          tokens.append("systempart=/dev/disk/by-partlabel/linux_system")
+          tokens.append("datapart=/dev/disk/by-partlabel/linux_data")
+          new_cmd = " ".join(tokens)
+          new_bytes = new_cmd.encode("ascii")
+          if len(new_bytes) >= 2048:
+              raise SystemExit("FATAL: patched vendor_cmdline exceeds 2047 bytes")
+
+          vb[28:2076] = new_bytes.ljust(2048, b"\x00")
+          p.write_bytes(vb)
+
+          verify_cmd = p.read_bytes()[28:2076].split(b"\x00", 1)[0].decode("ascii")
+          print("Patched  vendor_cmdline:", verify_cmd)
+          PYEOF
+
+          # 5. Bundle Windows platform-tools and Dual-Boot helper scripts
+          cp -a platform-tools ut_dualboot_package/platform-tools
+          rm -rf platform-tools
+
+          cat << 'SHEOF' > ut_dualboot_package/flash_ut_slot_b.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          FASTBOOT="fastboot"
+          [ -x "$DIR/platform-tools/fastboot" ] && FASTBOOT="$DIR/platform-tools/fastboot"
+
+          echo "================================================================"
+          echo "  Ubuntu Touch Dual-Boot Installer (Slot B) for Daria Bond"
+          echo "  - Keeps VollaOS 16 untouched on Slot A"
+          echo "  - NEVER touches preloader, lk, super, or Android userdata"
+          echo "  Prerequisite: GPT partitions 'linux_system' (10G) & 'linux_data'"
+          echo "================================================================"
+          read -r -p "Type YES to flash Ubuntu Touch to Slot B: " CONFIRM
+          [ "$CONFIRM" = "YES" ] || { echo "Aborted."; exit 1; }
+
+          read -r -p "Format 'linux_data'? (Type YES for FIRST install, NO for update): " WIPE_DATA
+
+          "$FASTBOOT" flash boot_b "$DIR/boot_ut.img"
+          "$FASTBOOT" flash init_boot_b "$DIR/init_boot_ut.img"
+          "$FASTBOOT" flash vendor_boot_b "$DIR/vendor_boot_ut.img"
+          "$FASTBOOT" flash linux_system "$DIR/system_ut.img"
+
+          if [ "$WIPE_DATA" = "YES" ]; then
+            echo "Erasing linux_data (Halium initrd will auto-format it as ext4 on first boot)..."
+            "$FASTBOOT" erase linux_data
+          fi
+
+          "$FASTBOOT" set_active b
+          echo "Done! Rebooting into Ubuntu Touch (Slot B)..."
+          "$FASTBOOT" reboot
+          SHEOF
+          chmod +x ut_dualboot_package/flash_ut_slot_b.sh
+
+          cat << 'BATEOF' > ut_dualboot_package/flash_ut_slot_b.bat
+          @echo off
+          setlocal
+          set "DIR=%~dp0"
+          set "FASTBOOT=%DIR%platform-tools\fastboot.exe"
+          if not exist "%FASTBOOT%" set "FASTBOOT=fastboot"
+
+          echo ================================================================
+          echo   Ubuntu Touch Dual-Boot Installer (Slot B) for Daria Bond
+          echo   - Keeps VollaOS 16 untouched on Slot A
+          echo   - NEVER touches preloader, lk, super, or Android userdata
+          echo   Prerequisite: GPT partitions 'linux_system' (10G) ^& 'linux_data'
+          echo ================================================================
+          set /p CONFIRM=Type YES to flash Ubuntu Touch to Slot B: 
+          if /I not "%CONFIRM%"=="YES" (
+              echo Aborted.
+              pause
+              exit /b 1
+          )
+
+          set /p WIPE_DATA=Format 'linux_data'? (Type YES for FIRST install, NO for update): 
+
+          "%FASTBOOT%" flash boot_b "%DIR%boot_ut.img" || goto :err
+          "%FASTBOOT%" flash init_boot_b "%DIR%init_boot_ut.img" || goto :err
+          "%FASTBOOT%" flash vendor_boot_b "%DIR%vendor_boot_ut.img" || goto :err
+          "%FASTBOOT%" flash linux_system "%DIR%system_ut.img" || goto :err
+
+          if /I "%WIPE_DATA%"=="YES" (
+              echo Erasing linux_data...
+              "%FASTBOOT%" erase linux_data || goto :err
+          )
+
+          "%FASTBOOT%" set_active b || goto :err
+          echo DONE! Rebooting into Ubuntu Touch ^(Slot B^)...
+          "%FASTBOOT%" reboot
+          pause
+          exit /b 0
+
+          :err
+          echo.
+          echo ERROR occurred while flashing! Do NOT reboot until resolved.
+          pause
+          exit /b 1
+          BATEOF
+
+          cat << 'SHEOF' > ut_dualboot_package/switch_to_linux.sh
+          #!/system/bin/sh
+          # Run with root (KernelSU/Magisk/Termux su) on VollaOS (Slot A) to boot Linux Mobile (Slot B)
+          bootctl set-active-boot-slot 1 && reboot
+          SHEOF
+          chmod +x ut_dualboot_package/switch_to_linux.sh
+
+          cat << 'SHEOF' > ut_dualboot_package/switch_to_android.sh
+          #!/bin/sh
+          # Run on Ubuntu Touch / Linux Mobile (Slot B) to boot VollaOS (Slot A)
+          sudo lxc-attach -n android -- bootctl set-active-boot-slot 0 && sudo reboot
+          SHEOF
+          chmod +x ut_dualboot_package/switch_to_android.sh
+
+          cat << 'DOCEOF' > ut_dualboot_package/README_DUALBOOT.txt
+          Daria Bond (zahedan) - Dual-Boot Guide (VollaOS 16 on Slot A + Linux Mobile on Slot B)
+          ======================================================================================
+
+          HOW IT WORKS:
+          - Keeps DariaOS stock preloader & lk untouched (NO hard-brick risk).
+          - VollaOS 16 lives on Slot A (boot_a / init_boot_a / vendor_boot_a).
+          - super.img mirrors vendor, vendor_dlkm, odm_dlkm, and system_dlkm into Slot B
+            so Ubuntu Touch (and future Sailfish OS / Droidian builds) run natively on Slot B.
+          - Linux rootfs & user data live on two dedicated GPT partitions at the end of UFS (sda):
+              1) linux_system : 10 GiB (10368709120 bytes / 10240 MiB)
+              2) linux_data   : Remaining space (recommended 30+ GiB)
+
+          STEP 1 — ONE-TIME PARTITIONING IN RECOVERY (TWRP):
+          * Back up all personal data first! Resizing userdata wipes Android data.
+          1. Boot recovery and open adb shell:
+               sgdisk --backup=/sdcard/gpt_backup.bin /dev/block/sda
+               adb pull /sdcard/gpt_backup.bin
+          2. Inspect the last partition (userdata) number and start/end sectors:
+               sgdisk --print /dev/block/sda | tail -n 10
+          3. Shrink userdata by at least 40 GiB and create two new partitions after it:
+               - Name: linux_system  | Size: 10 GiB  | Type: 8300 (Linux filesystem)
+               - Name: linux_data    | Size: rest    | Type: 8300 (Linux filesystem)
+          4. Format Android userdata in recovery and reboot to bootloader (fastboot).
+
+          STEP 2 — FLASH UBUNTU TOUCH TO SLOT B:
+          - Windows: Run flash_ut_slot_b.bat
+          - Linux/Mac: Run bash flash_ut_slot_b.sh
+          - Choose YES to erase linux_data on FIRST install (choose NO when updating later).
+
+          STEP 3 — SWITCHING BETWEEN VOLLAOS AND LINUX MOBILE:
+          - From Fastboot:
+              VollaOS (Slot A):      fastboot set_active a && fastboot reboot
+              Linux Mobile (Slot B): fastboot set_active b && fastboot reboot
+          - Directly from OS (no PC):
+              VollaOS -> Linux:  su -c "sh switch_to_linux.sh"
+              Linux -> VollaOS:  sh switch_to_android.sh
+
+          NOTE ON FUTURE VOLLAOS UPDATES:
+          If you later flash a new VollaOS release with flash_all.sh/.bat, it updates Slot A & B
+          firmware + super.img. Afterwards, re-run flash_ut_slot_b with WIPE_DATA=NO to restore
+          Ubuntu Touch boot images on Slot B without losing any Ubuntu Touch data.
+          DOCEOF
+
+          # 6. Package as a standalone .zip (fall back to split 7z only if > 1900 MiB for GitHub 2 GiB limit)
+          cd ut_dualboot_package
+          zip -6 -r ../volla-algiz-ubuntu-touch-dualboot.zip .
+          cd ..
+          rm -rf ut_dualboot_package ut_urls.env
+
+          ZIP_SIZE=$(stat -c%s volla-algiz-ubuntu-touch-dualboot.zip)
+          echo "Ubuntu Touch dual-boot zip size: $ZIP_SIZE bytes"
+          if [ "$ZIP_SIZE" -gt 1992294400 ]; then
+            echo "Zip exceeds 1900 MiB GitHub Release limit; splitting into 7z parts..."
+            mkdir -p tmp_repack && unzip -q volla-algiz-ubuntu-touch-dualboot.zip -d tmp_repack
+            rm -f volla-algiz-ubuntu-touch-dualboot.zip
+            (cd tmp_repack && 7z a -v1900m -mx=6 ../volla-algiz-ubuntu-touch-dualboot.7z *)
+            rm -rf tmp_repack
+          fi
+          ls -lh volla-algiz-ubuntu-touch-dualboot.*
+          df -h /
+
+      - name: Clean up platform-tools if UT dual-boot was skipped
+        if: steps.check.outputs.new_update == 'true'
+        run: rm -rf platform-tools
 
       - name: Create GitHub Release
         if: steps.check.outputs.new_update == 'true'
@@ -524,13 +841,13 @@ jobs:
           tag_name: stable-${{ steps.check.outputs.version_date }}
           name: "Volla Algiz Stable ${{ steps.check.outputs.version_date }}"
           body: |
-            ## Download & Extract
+            ## Download & Extract (VollaOS 16)
             Download **all** `volla-algiz-stable.7z.*` parts into the **same folder**, then extract **only the `.001` file**, the rest are loaded automatically.
 
             **Windows:** right-click `volla-algiz-stable.7z.001` → 7-Zip → Extract Here
             **Linux/Mac:** `7z x volla-algiz-stable.7z.001`
 
-            ## Flash
+            ## Flash (VollaOS 16)
             First reboot the phone to the bootloader: `adb reboot bootloader` (or power off and hold Volume Down + Power).
 
             ### Windows users
@@ -547,13 +864,20 @@ jobs:
             2. Open a terminal in the extracted folder and run: `bash flash_all.sh`
             3. Type `YES` and press Enter, then wait for **Done**.
 
-            If the phone isn't detected, install your distro's `android-udev-rules` package (or try the script with `sudo`).
-
             The phone reboots to recovery when flashing finishes. The manual command list is in `commands.txt`.
 
+            ## Dual-Boot Add-on (Linux Mobile on Slot B)
+            This build is **Linux Mobile Dual-Boot Ready** out of the box (`super.img` mirrors `vendor`, `vendor_dlkm`, `odm_dlkm`, and `system_dlkm` to Slot B while keeping DariaOS `preloader` and `lk` untouched).
+
+            * Download **`volla-algiz-ubuntu-touch-dualboot.zip`** (Ubuntu Touch `${{ steps.ut_dualboot.outputs.ut_version }}`) from the assets below.
+            * Extract it and follow `README_DUALBOOT.txt` (create `linux_system` + `linux_data` GPT partitions once, then run `flash_ut_slot_b.bat` / `flash_ut_slot_b.sh`).
+            * Future Sailfish OS / Droidian builds can use the exact same `linux_system` + `linux_data` partitions on Slot B.
+
             ## Notes
-            Every payload partition is flashed to both slots. `lk` and `preloader` are taken from DariaOS. `super.img` is the repacked super. `vbmeta`, `vbmeta_system` and `vbmeta_vendor` are flashed from `vbmeta-disabled.img` — stock vbmeta will not boot builds.
-          files: volla-algiz-stable.7z.*
+            `lk` and `preloader` are taken from DariaOS (stock Volla Multi-Boot Manager is removed to prevent bricking Daria `lk`). `super.img` is the dual-boot ready repacked super. `vbmeta`, `vbmeta_system` and `vbmeta_vendor` are flashed from `vbmeta-disabled.img` — stock vbmeta will not boot builds.
+          files: |
+            volla-algiz-stable.7z.*
+            volla-algiz-ubuntu-touch-dualboot.*
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
@@ -583,7 +907,8 @@ jobs:
           <b><u>VollaOS __VERSION__ | Android __ANDROID_MAJOR__.</u></b>
           <b>Updated: __DATE__</b>
 
-          <blockquote>• Updater removed
+          <blockquote>• Updater &amp; unsafe stock Multi-Boot removed
+          • Linux Mobile Dual-Boot ready (Slot B HAL included + separate Ubuntu Touch zip)
           • Don’t use ADB sideload for updates!</blockquote>
 
           ×| <a href="__RELEASE_URL__">Download</a>

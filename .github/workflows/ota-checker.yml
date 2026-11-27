@@ -45,7 +45,6 @@ jobs:
         run: |
           cat << 'PYEOF' > check_ota.py
           #!/usr/bin/env python3
-          """Check Volla OTA server for new stable updates for the Algiz device."""
 
           import os
           import re
@@ -183,7 +182,6 @@ jobs:
           set -euo pipefail
           mkdir -p dualboot_artifacts/apk_build/res/drawable dualboot_artifacts/apk_build/src/org/zahedan/dualboot dualboot_artifacts/apk_build/classes dualboot_artifacts/apk_build/dex_out
 
-          # 1. Compile universal static ARM64 A/B slot switcher (CRC32-verified AOSP bootloader_control)
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross linux-libc-dev-arm64-cross zip
 
@@ -325,11 +323,9 @@ jobs:
               int other = 1 - target;
               memcpy(buf, target == 0 ? "_a\0\0" : "_b\0\0", 4);
 
-              /* Set target slot highest priority (15), tries=7, successful=1 so Linux OS never rolls back */
               buf[12 + target * 2] = (uint8_t)((1U << 7) | (7U << 4) | 15U);
               buf[12 + target * 2 + 1] = 0U;
 
-              /* Keep other slot permanently bootable as secondary (priority=14) */
               buf[12 + other * 2] = (uint8_t)((1U << 7) | (7U << 4) | 14U);
               buf[12 + other * 2 + 1] = 0U;
 
@@ -357,7 +353,6 @@ jobs:
           file dualboot_artifacts/switch-slot
           ls -lh dualboot_artifacts/switch-slot
 
-          # 2. Build SwitchToLinux.apk (Launcher Icon + Quick Settings Tile) using preinstalled Android SDK
           ANDROID_SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           BT_DIR=$(ls -d "$ANDROID_SDK"/build-tools/* 2>/dev/null | sort -V | tail -n 1)
           PLAT_JAR=$(ls "$ANDROID_SDK"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -n 1)
@@ -368,8 +363,6 @@ jobs:
           cd dualboot_artifacts/apk_build
           mkdir -p res/values
 
-          # The launcher activity only hosts a dialog. Theme.Translucent.NoTitleBar paints the status bar
-          # solid black behind the dialog, so use a DeviceDefault theme with transparent system bars.
           cat << 'XMLEOF' > res/values/styles.xml
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
@@ -435,9 +428,6 @@ jobs:
           </vector>
           XMLEOF
 
-          # Quick Settings tiles are tinted by the system (only the alpha channel is used), so the
-          # colored launcher icon would turn into a plain disc. This variant cuts the arrows out of
-          # the circle (evenOdd) so the tile shows the same icon as the app.
           cat << 'XMLEOF' > res/drawable/ic_tile_switch.xml
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="24dp"
@@ -460,7 +450,6 @@ jobs:
           final class SwitchHelper {
               private SwitchHelper() {}
 
-              // Falls back to a copy in /data/local/tmp when the exec bit of /system/bin/switch-slot was lost in the repack.
               private static final String CMD =
                   "B=/system/bin/switch-slot; "
                   + "[ -x $B ] || { cp $B /data/local/tmp/switch-slot "
@@ -468,7 +457,6 @@ jobs:
                   + "&& B=/data/local/tmp/switch-slot; }; "
                   + "$B 1";
 
-              /** Switches to Slot B and reboots. Returns null on success, otherwise a message to show. */
               static String run() {
                   StringBuilder out = new StringBuilder();
                   int code = -1;
@@ -544,10 +532,6 @@ jobs:
           import android.service.quicksettings.TileService;
           import android.widget.Toast;
 
-          // Two-tap confirmation done inside the tile itself: the first tap arms the tile ("Tap again to
-          // confirm"), the second tap within a few seconds switches to Slot B and reboots. No dialog and
-          // no activity are started, so the notification shade / status bar is never collapsed, re-opened
-          // or covered by anything.
           public class SwitchTileService extends TileService {
               private static final long CONFIRM_WINDOW_MS = 4000;
 
@@ -708,7 +692,7 @@ jobs:
         if: steps.check.outputs.new_update == 'true'
         run: git clone --branch v4 --depth 1 https://github.com/ravindu644/Android_Image_Tools.git
 
-      - name: Patch props, remove stock Updater/Multi-Boot, and inject Switch to Linux
+      - name: Patch props, fix VoLTE & Iran APNs, remove stock Updater/Multi-Boot, and inject Switch to Linux
         if: steps.check.outputs.new_update == 'true'
         run: |
           set -euo pipefail
@@ -779,7 +763,6 @@ jobs:
           echo "Patched version props:"
           sudo grep -R --include='*.prop' -nE 'ro\.(volla\.build|lineage)\.version=' EXTRACTED_IMAGES/extracted_system EXTRACTED_IMAGES/extracted_product || true
 
-          # Remove stock Updater and stock Volla Multi-Boot Manager (flashing Volla lk bricks Daria Bond)
           echo "Removing stock Updater and stock Multi-Boot/BootManager apps:"
           sudo find EXTRACTED_IMAGES/extracted_system_ext EXTRACTED_IMAGES/extracted_system EXTRACTED_IMAGES/extracted_product \
             -type d \( \
@@ -791,10 +774,6 @@ jobs:
               -ipath '*/priv-app/*abm*' \
             \) -prune -print -exec rm -rf {} + 2>/dev/null || true
 
-          # Second pass: the app folder may have any name, so also match by package name / app label.
-          # NOTE: this must not rely on the Android SDK (aapt2): the "Free disk space" step above deletes
-          # /usr/local/lib/android, so the old aapt2 based pass silently never ran. The scan below only
-          # needs python3 and looks into AndroidManifest.xml (package name) and resources.arsc (labels).
           cat << 'PYEOF' > ../remove_bootmanager.py
           import os
           import shutil
@@ -806,7 +785,6 @@ jobs:
           PROTECTED_DIRS = {"settings", "settingsintelligence", "systemui", "framework-res", "volladialer", "launcher3", "launcher"}
 
           def ascii_lower(data):
-              # Binary XML / arsc strings are UTF-8 or UTF-16LE; dropping NUL bytes turns both into plain ASCII.
               return data.replace(b"\x00", b"").lower()
 
           def classify(apk):
@@ -856,7 +834,6 @@ jobs:
                       else:
                           shutil.rmtree(apk_dir)
               if mode == "remove":
-                  # Leftover permission / sysconfig files of the removed apps are harmless but confusing.
                   for root in roots:
                       for dirpath, _dirs, files in os.walk(root):
                           if "/etc/" not in dirpath.replace("\\", "/") + "/":
@@ -874,11 +851,9 @@ jobs:
               sys.exit(0 if main() >= 0 else 1)
           PYEOF
           BM_ROOTS="EXTRACTED_IMAGES/extracted_system_ext EXTRACTED_IMAGES/extracted_system EXTRACTED_IMAGES/extracted_product"
-          # shellcheck disable=SC2086
           sudo python3 -I ../remove_bootmanager.py remove $BM_ROOTS
 
           echo "Verifying that no Boot Manager apk is left:"
-          # shellcheck disable=SC2086
           left=$(sudo python3 -I ../remove_bootmanager.py check $BM_ROOTS | grep -c '^MATCH' || true)
           if [ "${left:-0}" -ne 0 ]; then
             echo "FATAL: Boot Manager apk(s) are still present"
@@ -888,19 +863,73 @@ jobs:
           sudo find $BM_ROOTS -type f -name '*.apk' \( -path '*/app/*' -o -path '*/priv-app/*' \) 2>/dev/null \
             | grep -iE 'boot|volla|ubports|multi' || true
 
-          # Inject universal /system/bin/switch-slot binary
           SYS_BIN="EXTRACTED_IMAGES/extracted_system/system/bin"
           [ -d "$SYS_BIN" ] || SYS_BIN="EXTRACTED_IMAGES/extracted_system/bin"
           sudo install -m 0755 -o 0 -g 0 ../dualboot_artifacts/switch-slot "$SYS_BIN/switch-slot"
           echo "Installed switch-slot -> $SYS_BIN/switch-slot"
 
-          # Inject preinstalled SwitchToLinux.apk (Launcher icon + Quick Settings tile)
           APP_BASE="EXTRACTED_IMAGES/extracted_product/app"
           [ -d "$APP_BASE" ] || APP_BASE="EXTRACTED_IMAGES/extracted_system/system/app"
           [ -d "$APP_BASE" ] || APP_BASE="EXTRACTED_IMAGES/extracted_system/app"
           sudo install -d -m 0755 -o 0 -g 0 "$APP_BASE/SwitchToLinux"
           sudo install -m 0644 -o 0 -g 0 ../dualboot_artifacts/SwitchToLinux.apk "$APP_BASE/SwitchToLinux/SwitchToLinux.apk"
           echo "Installed SwitchToLinux.apk -> $APP_BASE/SwitchToLinux/SwitchToLinux.apk"
+
+          PROD_ETC="EXTRACTED_IMAGES/extracted_product/etc"
+          [ -d "EXTRACTED_IMAGES/extracted_product/product/etc" ] && PROD_ETC="EXTRACTED_IMAGES/extracted_product/product/etc"
+          sudo install -d -m 0755 -o 0 -g 0 "$PROD_ETC/init"
+          sudo tee "$PROD_ETC/init/volte_mtk_fix.rc" > /dev/null << 'RCEOF'
+          on early-boot && property:persist.vendor.mtk_dynamic_ims_switch=1
+              setprop persist.vendor.mtk.volte.enable 1
+              setprop persist.vendor.mtk_dynamic_ims_switch 0
+          RCEOF
+          sudo chmod 0644 "$PROD_ETC/init/volte_mtk_fix.rc"
+          sudo chown 0:0 "$PROD_ETC/init/volte_mtk_fix.rc"
+          sudo setfattr -n security.selinux -v "u:object_r:system_file:s0" "$PROD_ETC/init/volte_mtk_fix.rc" 2>/dev/null || true
+          echo "Installed volte_mtk_fix.rc -> $PROD_ETC/init/volte_mtk_fix.rc"
+
+          APN_XML=""
+          for cand in \
+                        "$PROD_ETC/apns-conf.xml"             "EXTRACTED_IMAGES/extracted_system/system/etc/apns-conf.xml"             "EXTRACTED_IMAGES/extracted_system/etc/apns-conf.xml"; do
+            [ -f "$cand" ] && { APN_XML="$cand"; break; }
+          done
+          [ -n "$APN_XML" ] || { echo "FATAL: apns-conf.xml not found"; exit 1; }
+          sudo python3 - "$APN_XML" << 'PYEOF'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          path = sys.argv[1]
+          iran_apns = [
+              '<apn carrier="Samantel" mcc="432" mnc="01" apn="samantel" type="default,supl" protocol="IPV4V6" roaming_protocol="IPV4V6" />',
+              '<apn carrier="IMS" mcc="432" mnc="01" apn="ims" type="ims" protocol="IPV4V6" roaming_protocol="IPV4V6" network_type_bitmask="1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20" />',
+              '<apn carrier="Shatelmobile" mcc="432" mnc="08" apn="shatelmobile" type="default,supl" protocol="IPV4V6" roaming_protocol="IPV4V6" />',
+              '<apn carrier="IMS" mcc="432" mnc="08" apn="ims" type="ims" protocol="IPV4V6" roaming_protocol="IPV4V6" network_type_bitmask="1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20" />',
+              '<apn carrier="IR-MCI" mcc="432" mnc="11" apn="mcinet" type="default,supl" protocol="IPV4V6" roaming_protocol="IPV4V6" />',
+              '<apn carrier="IR-MCI MMS" mcc="432" mnc="11" apn="mcinet" mmsc="http://192.168.193.134:38090/was" mmsproxy="192.168.194.73" mmsport="8080" type="mms" />',
+              '<apn carrier="IMS" mcc="432" mnc="11" apn="ims" type="ims" protocol="IPV4V6" roaming_protocol="IPV4V6" network_type_bitmask="1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20" />',
+              '<apn carrier="Rightel" mcc="432" mnc="20" apn="rightel" type="default,supl" protocol="IPV4V6" roaming_protocol="IPV4V6" />',
+              '<apn carrier="Rightel MMS" mcc="432" mnc="20" apn="RighTel-WAP" mmsc="http://10.200.40.55:38090/was" mmsproxy="10.200.39.10" mmsport="8080" type="mms" />',
+              '<apn carrier="IMS" mcc="432" mnc="20" apn="ims" type="ims" protocol="IPV4V6" roaming_protocol="IPV4V6" network_type_bitmask="1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20" />',
+              '<apn carrier="Irancell" mcc="432" mnc="35" apn="irancell" type="default,supl" protocol="IPV4V6" roaming_protocol="IPV4V6" />',
+              '<apn carrier="Irancell MMS" mcc="432" mnc="35" apn="irancell" mmsc="http://mms:8002" mmsproxy="10.131.26.138" mmsport="8080" type="mms" />',
+              '<apn carrier="IMS" mcc="432" mnc="35" apn="ims" type="ims" protocol="IPV4V6" roaming_protocol="IPV4V6" network_type_bitmask="1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20" />',
+          ]
+
+          tree = ET.parse(path)
+          root = tree.getroot()
+          for el in list(root):
+              if el.tag == "apn" and el.attrib.get("mcc") == "432":
+                  root.remove(el)
+          for raw in iran_apns:
+              root.append(ET.fromstring(raw))
+          ET.indent(tree, space="  ")
+          tree.write(path, encoding="utf-8", xml_declaration=True)
+          PYEOF
+          sudo chmod 0644 "$APN_XML"
+          sudo chown 0:0 "$APN_XML"
+          iran_apn_count=$(grep -c 'mcc="432"' "$APN_XML" || true)
+          echo "Patched Iran APNs -> $APN_XML ($iran_apn_count entries)"
+          [ "${iran_apn_count:-0}" -eq 13 ] || { echo "FATAL: unexpected Iran APN count ($iran_apn_count)"; exit 1; }
 
           for part in system product system_ext; do
             meta="EXTRACTED_IMAGES/extracted_${part}/.repack_info/metadata.txt"
@@ -1150,7 +1179,6 @@ jobs:
           set -euo pipefail
           mkdir -p ut_dualboot_package
 
-          # 1. Fetch latest algiz-a15 Ubuntu Touch URLs dynamically from Volla ABM server
           python3 - << 'PYEOF' > ut_urls.env
           import requests, sys
 
@@ -1175,13 +1203,11 @@ jobs:
           source ut_urls.env
           echo "ut_version=${UT_VERSION}" >> "$GITHUB_OUTPUT"
 
-          # 2. Download boot, init_boot, vendor_boot, and system.img
           curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/boot_ut.img "$UT_BOOT_URL"
           curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/init_boot_ut.img "$UT_INIT_BOOT_URL"
           curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/vendor_boot_ut.img "$UT_VENDOR_BOOT_URL"
           curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/system_ut_raw.img "$UT_SYSTEM_URL"
 
-          # 3. Ensure raw ext4, inject one-tap "Reboot to Android" icon & helper directly into UT rootfs
           if file ut_dualboot_package/system_ut_raw.img | grep -qi 'Android sparse'; then
             simg2img ut_dualboot_package/system_ut_raw.img ut_dualboot_package/system_ut_unsparse.img
             mv -f ut_dualboot_package/system_ut_unsparse.img ut_dualboot_package/system_ut_raw.img
@@ -1194,7 +1220,6 @@ jobs:
             fi
             e2fsck -fy ut_dualboot_package/system_ut_raw.img || true
 
-            # Add 16 MiB headroom if image is tightly packed (staying safely under 10368709120 bytes)
             CUR_SZ=$(stat -c%s ut_dualboot_package/system_ut_raw.img)
             MAX_UT_SZ=10368709120
             if [ $((CUR_SZ + 16777216)) -le "$MAX_UT_SZ" ]; then
@@ -1255,9 +1280,6 @@ jobs:
             sudo chmod 0644 ut_mnt/usr/share/switch-to-vollaos/confirm.qml
             sudo chown 0:0 ut_mnt/usr/share/switch-to-vollaos/confirm.qml
 
-            # Ask "Are you sure?" first. Only an explicit tap on "Reboot to Android" continues.
-            # If the dialog cannot be shown at all (no qmlscene / QML failed to load) the switch
-            # runs directly, as before. Older Ubuntu Touch uses Ubuntu.Components instead of Lomiri.
             sudo tee ut_mnt/usr/local/bin/switch-to-vollaos > /dev/null << 'SHEOF'
           #!/bin/sh
           QML=/usr/share/switch-to-vollaos/confirm.qml
@@ -1318,13 +1340,11 @@ jobs:
             echo "WARNING: system_ut_raw.img is not ext4 ($(file -b ut_dualboot_package/system_ut_raw.img)); skipping rootfs icon injection."
           fi
 
-          # 4. Convert raw system.img to Android sparse format for fast, reliable fastboot flashing & smaller zip
           echo "Converting Ubuntu Touch system.img to Android sparse image..."
           img2simg ut_dualboot_package/system_ut_raw.img ut_dualboot_package/system_ut.img
           rm -f ut_dualboot_package/system_ut_raw.img
           ls -lh ut_dualboot_package/
 
-          # 5. Patch vendor_boot_ut.img v4 cmdline in-place (preserves v4 multi-fragment ramdisk & recovery)
           python3 - << 'PYEOF'
           import struct
           from pathlib import Path
@@ -1362,7 +1382,6 @@ jobs:
           print("Patched  vendor_cmdline:", verify_cmd)
           PYEOF
 
-          # 6. Bundle Windows platform-tools and Dual-Boot flash scripts
           cp -a platform-tools ut_dualboot_package/platform-tools
           rm -rf platform-tools
           cp -f flash/prepare_gpt.sh ut_dualboot_package/prepare_gpt.sh
@@ -1449,7 +1468,6 @@ jobs:
           exit /b 1
           BATEOF
 
-          # 7. Package as a standalone .zip (fall back to split 7z only if > 1900 MiB for GitHub 2 GiB limit)
           cd ut_dualboot_package
           zip -6 -r ../volla-algiz-ubuntu-touch-dualboot.zip .
           cd ..

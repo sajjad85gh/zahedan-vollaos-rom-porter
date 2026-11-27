@@ -1,31 +1,26 @@
 #!/usr/bin/env bash
-# prepare_gpt.sh - dual-boot partition preparation for Daria Bond I (zahedan).
-#
-# Replaces the manual "boot TWRP + sgdisk" step. It runs on the PC and drives the phone
-# over adb while Android is running (root via Magisk/KernelSU is required).
-#
-#   1. detects the disk that holds `userdata` (nothing is hard-coded)
-#   2. dumps the GPT areas and computes the new layout with gpt_edit.py
-#   3. shrinks `userdata` and creates `linux_system` + `linux_data` right after it
-#      (partitions that follow userdata, e.g. flashinfo, stay where they are)
-#   4. verifies the written GPT and rolls back automatically on any mismatch
-#   5. reboots to the bootloader and wipes userdata/metadata (the old filesystem no longer fits)
+# prepare_gpt.sh - dual-boot partition preparation & removal for Daria Bond I (zahedan).
 #
 # Usage:
 #   bash prepare_gpt.sh [--dry-run] [--linux-gib N] [--backup | --no-backup]
+#   bash prepare_gpt.sh --remove [--dry-run]
 #   bash prepare_gpt.sh --restore <backup_dir>
 #
 # Requirements: adb, fastboot and python3 on the PC, USB debugging enabled, root on the phone.
-# Only `dd` is used on the phone. On Windows use Git Bash or WSL.
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
 
 # `pwd -W` gives a C:/... path in Git Bash (native adb.exe/python need it); plain `pwd` elsewhere.
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && { pwd -W 2>/dev/null || pwd; })
+UNIX_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 GPT_PY=$HERE/gpt_edit.py
 
-LINUX_GIB=""                      # total space for Linux (linux_system + linux_data); asked interactively if unset
+if [ -d "$UNIX_HERE/platform-tools" ]; then
+  PATH="$UNIX_HERE/platform-tools:$PATH"
+fi
+
+LINUX_GIB=""
 DEFAULT_LINUX_GIB=40
 LINUX_SYSTEM_BYTES=10368709120     # must match the image size limit in ota-checker.yml
 MIN_DATA_GIB=30
@@ -35,11 +30,36 @@ REMOTE_TMP=/data/local/tmp
 DUMP_BLOCKS=256                    # 256 * 4096 = 1 MiB dumped from each end of the disk
 
 DRY_RUN=0
-BACKUP_CHOICE=""                    # yes|no; asked interactively if unset (prepare_gpt.bat asks and passes --backup/--no-backup)
+REMOVE_MODE=0
+BACKUP_CHOICE=""
 RESTORE_DIR=""
 DISK=""
 LINK_PNUM=""
 BK=""
+WORK=""
+TMP_BK=""
+
+cleanup_and_pause() {
+  local code=$?
+  [ -n "${WORK:-}" ] && rm -rf "$WORK" 2>/dev/null || true
+  [ -n "${TMP_BK:-}" ] && rm -rf "$TMP_BK" 2>/dev/null || true
+  if [ -z "${NO_PAUSE:-}" ] && { [ -t 0 ] || [ -t 1 ]; }; then
+    echo
+    if [ "$code" -ne 0 ]; then
+      echo "================================================================"
+      echo " STOPPED WITH ERROR (exit code $code). Read the messages above."
+      echo "================================================================"
+    else
+      echo "================================================================"
+      echo " FINISHED. You can close this window now."
+      echo "================================================================"
+    fi
+    if [ -e /dev/tty ]; then
+      read -r -p "Press Enter to close..." _ </dev/tty 2>/dev/null || true
+    fi
+  fi
+}
+trap cleanup_and_pause EXIT
 
 die()  { echo "[ERROR] $*" >&2; exit 1; }
 info() { echo ">> $*"; }
@@ -50,18 +70,18 @@ rsh() { adb shell "su -c '$*'" </dev/null | tr -d '\r'; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)    DRY_RUN=1 ;;
+    --remove|--revert) REMOVE_MODE=1 ;;
     --backup)     BACKUP_CHOICE=yes ;;
     --no-backup)  BACKUP_CHOICE=no ;;
     --linux-gib|--shrink-gib) LINUX_GIB=${2:?$1 needs a value}; shift ;;
     --restore)    RESTORE_DIR=${2:?--restore needs a backup directory}; shift ;;
-    -h|--help)    sed -n '2,19p' "$0"; exit 0 ;;
+    -h|--help)    sed -n '2,10p' "$0"; exit 0 ;;
     *)            die "Unknown argument: $1" ;;
   esac
   shift
 done
 [ -z "$LINUX_GIB" ] || [[ $LINUX_GIB =~ ^[0-9]+$ ]] || die "--linux-gib must be an integer."
 
-# Pick a working Python 3 (on Windows "python3" is often a Microsoft Store stub that fails).
 find_python() {
   local c
   for c in python3 python py; do
@@ -73,14 +93,11 @@ find_python() {
   die "Python 3 not found in PATH. On Windows install it from https://www.python.org/downloads/ (tick 'Add python.exe to PATH') or run: winget install Python.Python.3.12 , then start this script again."
 }
 
-# Wait up to 90 s for an authorized adb device and tell the user what to do (firewall, RSA prompt, cable...).
 wait_for_adb() {
   local st="" i
   info "Starting the adb server (if Windows asks to allow adb through the firewall, click 'Allow')..."
-  # Not silenced on purpose: the first start of the adb daemon can hang behind a Windows Firewall prompt.
   adb start-server </dev/null 2>&1 | tr -d '\r' || true
   for i in $(seq 90); do
-    # A device line is "<serial><TAB><state>"; daemon messages ("* daemon started ...") are ignored.
     st=$(adb devices </dev/null 2>/dev/null | tr -d '\r' | awk -F'\t' 'NF>=2 && $1 !~ /^\*/ { print $2; exit }')
     case "$st" in
       device) info "adb device found."; return 0 ;;
@@ -108,7 +125,6 @@ require_tools() {
     || die "Root is required. Grant su access to the adb shell (Magisk/KernelSU)."
 }
 
-# Resolve the disk that contains `userdata` from the by-name link. Override: GPT_DISK=/dev/block/<disk>
 find_disk() {
   if [ -n "${GPT_DISK:-}" ]; then
     DISK=$GPT_DISK
@@ -141,7 +157,6 @@ read_geometry() {
   TAIL_SKIP=$(( TOTAL_BYTES / 4096 - DUMP_BLOCKS ))
 }
 
-# dump_disk <dir>: raw copy of the first and last 1 MiB of the disk
 dump_disk() {
   mkdir -p "$1"
   adb exec-out "su -c 'dd if=$DISK bs=4096 count=$DUMP_BLOCKS 2>/dev/null'" </dev/null > "$1/head.bin"
@@ -152,14 +167,13 @@ dump_disk() {
   done
 }
 
-gpt_cmd() {  # gpt_cmd <plan|verify> <dump_dir> [extra args...]
+gpt_cmd() {
   local sub=$1 dir=$2
   shift 2
   "$PY" "$GPT_PY" "$sub" --head "$dir/head.bin" --tail "$dir/tail.bin" \
     --sector-size "$SSZ" --total-sectors "$TOTAL_SECTORS" "$@"
 }
 
-# apply_patches <dir>: write every "LBA file" line of <dir>/manifest.txt to the disk, in order
 apply_patches() {
   local lba file
   while read -r lba file; do
@@ -175,8 +189,6 @@ fb_ready() {
   [[ $o == *fastboot* ]]
 }
 
-# Prints the size in bytes of a partition as seen by the bootloader (empty if unknown).
-# fastboot reports partition-size as hex, usually WITHOUT a 0x prefix (e.g. "26a800000").
 fb_size() {
   local out v
   out=$(fastboot getvar "partition-size:$1" 2>&1 || true)
@@ -185,6 +197,7 @@ fb_size() {
 }
 
 reboot_and_wipe() {
+  local set_slot_a=${1:-0}
   info "Rebooting to the bootloader..."
   adb reboot bootloader
   info "Waiting for fastboot (up to 120 s)..."
@@ -198,6 +211,10 @@ reboot_and_wipe() {
   if [ -n "$(fb_size metadata)" ]; then
     fastboot erase metadata || die "Erasing metadata failed. Do NOT boot Android; run: fastboot erase metadata"
   fi
+  if [ "$set_slot_a" -eq 1 ]; then
+    info "Setting active boot slot to Slot A (Android)..."
+    fastboot --set-active=a || true
+  fi
 }
 
 confirm() {
@@ -206,7 +223,61 @@ confirm() {
   [ "$answer" = "YES" ] || die "Aborted."
 }
 
-# ---------------------------------------------------------------- restore mode
+run_remove_flow() {
+  local rm_args=()
+  [ -n "$LINK_PNUM" ] && rm_args+=(--expect-userdata-number "$LINK_PNUM")
+
+  echo
+  local rc=0
+  gpt_cmd remove "$WORK/before" "${rm_args[@]}" || rc=$?
+  [ "$rc" -eq 11 ] && { info "No Linux partitions found. Nothing to remove."; exit 0; }
+  [ "$rc" -eq 0 ] || exit 1
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "Dry run: nothing was changed."
+    exit 0
+  fi
+
+  confirm "This REMOVES linux_system & linux_data, returns all space to userdata, and ERASES ALL ANDROID & LINUX DATA."
+
+  BK=$(mktemp -d "$HERE/.gpt_remove_undo.XXXXXX")
+  gpt_cmd remove "$WORK/before" "${rm_args[@]}" --out "$BK/plan" >/dev/null || die "Could not create the removal patch files."
+
+  rollback_remove() {
+    echo "[ERROR] $1" >&2
+    echo "Restoring previous partition table..." >&2
+    if apply_patches "$BK/plan/undo"; then
+      rm -rf "$BK" 2>/dev/null || true
+      echo "Previous partition table restored; no data was touched." >&2
+    else
+      echo "ROLLBACK FAILED. Previous sectors are saved in $BK/plan/undo." >&2
+    fi
+    exit 1
+  }
+
+  info "Writing restored partition table (merging Linux space back into userdata)..."
+  apply_patches "$BK/plan/new" || rollback_remove "Writing the updated partition table failed."
+
+  info "Verifying..."
+  dump_disk "$WORK/after"
+  gpt_cmd verify "$WORK/after" --plan "$BK/plan/plan.json" --state new || rollback_remove "Written GPT did not match the removal plan."
+  info "Partition table updated and verified."
+
+  reboot_and_wipe 1
+
+  TMP_BK="$BK"
+  UD_BL=$(fb_size userdata)
+  echo
+  if [ -n "$UD_BL" ]; then
+    info "Done. Bootloader now reports userdata = $UD_BL bytes (~$(( UD_BL / 1073741824 )) GiB)."
+  else
+    info "Done. Linux partitions removed and userdata wiped."
+  fi
+  info "Reboot to Android now (fastboot reboot); Android will format userdata to full capacity on first boot."
+  exit 0
+}
+
+# ---------------------------------------------------------------- restore mode (from backup folder)
 if [ -n "$RESTORE_DIR" ]; then
   [ -s "$RESTORE_DIR/plan/undo/manifest.txt" ] && [ -s "$RESTORE_DIR/disk.env" ] \
     || die "$RESTORE_DIR does not look like a backup made by this script."
@@ -214,13 +285,13 @@ if [ -n "$RESTORE_DIR" ]; then
   GPT_DISK=$(sed -n 's/^DISK=//p' "$RESTORE_DIR/disk.env")
   find_disk
   read_geometry
-  confirm "This restores the original partition table on $DISK and wipes Android data."
+  confirm "This restores the original partition table on $DISK and wipes Android/Linux data."
   apply_patches "$RESTORE_DIR/plan/undo" || die "Writing the original partition table failed."
-  WORK=$(mktemp -d "$HERE/.gpt_work.XXXXXX"); trap 'rm -rf "$WORK"' EXIT
+  WORK=$(mktemp -d "$HERE/.gpt_work.XXXXXX")
   dump_disk "$WORK"
   gpt_cmd verify "$WORK" --plan "$RESTORE_DIR/plan/plan.json" --state orig || die "Restored GPT did not verify."
-  reboot_and_wipe
-  info "Original partition table restored. Boot Android; it will format userdata on first start."
+  reboot_and_wipe 1
+  info "Original partition table restored. Run 'fastboot reboot' to boot Android; it will format userdata on first start."
   exit 0
 fi
 
@@ -234,14 +305,30 @@ bat=$(adb shell dumpsys battery </dev/null | tr -d '\r' | awk '/level:/ { print 
 [[ ${bat:-} =~ ^[0-9]+$ ]] && [ "$bat" -ge 40 ] || die "Battery level is unknown or below 40%. Charge the phone first."
 
 WORK=$(mktemp -d "$HERE/.gpt_work.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT
 dump_disk "$WORK/before"
+
+# Direct --remove mode (no backup needed)
+if [ "$REMOVE_MODE" -eq 1 ]; then
+  run_remove_flow
+fi
 
 LIMIT_ARGS=(--system-bytes "$LINUX_SYSTEM_BYTES" --min-data-gib "$MIN_DATA_GIB" --min-userdata-gib "$MIN_USERDATA_GIB")
 echo
 rc=0
 LIMITS=$(gpt_cmd limits "$WORK/before" "${LIMIT_ARGS[@]}") || rc=$?
-[ "$rc" -eq 10 ] && { info "linux_system / linux_data already exist. Nothing to do."; exit 0; }
+if [ "$rc" -eq 10 ]; then
+  info "linux_system / linux_data already exist on this device."
+  if [ "$DRY_RUN" -eq 0 ] && [ -t 0 ]; then
+    echo
+    echo "If you want to delete the Linux partitions and return all storage back to Android:"
+    read -r -p "Type REMOVE to reclaim space for Android, or press Enter to exit: " rm_ans
+    if [ "$rm_ans" = "REMOVE" ]; then
+      run_remove_flow
+    fi
+  fi
+  info "Nothing changed."
+  exit 0
+fi
 [ "$rc" -eq 0 ] || exit 1
 read -r MIN_GIB MAX_GIB <<<"$LIMITS"
 
@@ -274,14 +361,12 @@ fi
 confirm "This ERASES ALL ANDROID DATA (userdata is shrunk and wiped). Back up your files first."
 
 # ---------------------------------------------------------------- backup + apply
-# Ask before saving the backup. The data needed for the automatic rollback is always created;
-# if the user declines, it lives in a temporary folder that is removed after a successful run.
 KEEP_BACKUP=1
 [ "$BACKUP_CHOICE" != "no" ] || KEEP_BACKUP=0
 if [ -z "$BACKUP_CHOICE" ] && [ -t 0 ] && [ -z "${BACKUP_DIR:-}" ]; then
   echo
   echo "A backup of the original partition table (head/tail of the disk + undo patches) can be saved"
-  echo "in ./gpt_backup_<date>-<time>/ . It is the only way to undo the change later (--restore)."
+  echo "in ./gpt_backup_<date>-<time>/ . (You can also revert later with --remove even without a backup.)"
   read -r -p "Save the backup? Type YES to save, NO to skip [YES]: " ans
   case "${ans:-YES}" in
     n|N|no|NO|No) KEEP_BACKUP=0 ;;
@@ -291,7 +376,7 @@ if [ "$KEEP_BACKUP" -eq 1 ]; then
   BK=${BACKUP_DIR:-./gpt_backup_$(date +%Y%m%d-%H%M%S)}
 else
   BK=$(mktemp -d "$HERE/.gpt_undo.XXXXXX")
-  info "Backup skipped: you will NOT be able to restore the original partition table later."
+  info "Backup skipped (you can still revert later using: bash prepare_gpt.sh --remove)."
 fi
 mkdir -p "$BK"
 printf 'DISK=%s\nSSZ=%s\nTOTAL_SECTORS=%s\n' "$DISK" "$SSZ" "$TOTAL_SECTORS" > "$BK/disk.env"
@@ -299,13 +384,14 @@ cp -r "$WORK/before" "$BK/before"
 gpt_cmd plan "$BK/before" "${PLAN_ARGS[@]}" --out "$BK/plan" >/dev/null || die "Could not create the patch files."
 if [ "$KEEP_BACKUP" -eq 1 ]; then
   info "Backup and patch files are in $BK (keep them until the dual-boot setup works)."
-  info "To undo later: bash prepare_gpt.sh --restore ${BK#./}"
+  info "To undo later: bash prepare_gpt.sh --restore ${BK#./}  (or --remove)"
 fi
 
 rollback() {
   echo "[ERROR] $1" >&2
   echo "Restoring the original partition table..." >&2
   if apply_patches "$BK/plan/undo"; then
+    [ "$KEEP_BACKUP" -eq 1 ] || rm -rf "$BK" 2>/dev/null || true
     echo "Original partition table restored; no data was touched." >&2
   else
     echo "ROLLBACK FAILED. The original sectors are in $BK/plan/undo (see manifest.txt: LBA and file per line)." >&2
@@ -322,7 +408,7 @@ gpt_cmd verify "$WORK/after" --plan "$BK/plan/plan.json" --state new || rollback
 info "Partition table written and verified."
 
 # ---------------------------------------------------------------- wipe + bootloader check
-reboot_and_wipe
+reboot_and_wipe 0
 
 SYS_BL=$(fb_size linux_system)
 DATA_BL=$(fb_size linux_data)
@@ -330,7 +416,7 @@ if [ -z "$SYS_BL" ] || [ -z "$DATA_BL" ] || [ "$SYS_BL" -lt "$LINUX_SYSTEM_BYTES
   die "The bootloader does not report linux_system/linux_data as expected. Do not flash anything; check 'fastboot getvar all'."
 fi
 
-[ "$KEEP_BACKUP" -eq 1 ] || rm -rf "$BK"
+[ "$KEEP_BACKUP" -eq 1 ] || TMP_BK="$BK"
 
 echo
 info "Done. The bootloader sees linux_system ($SYS_BL bytes) and linux_data ($DATA_BL bytes)."

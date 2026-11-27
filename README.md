@@ -1,5 +1,7 @@
 # VollaOS (Quintus) for Daria Bond I
 
+**English** | [فارسی (Persian)](README.fa.md)
+
 An unofficial, fully automated port of **Volla OS** to the **Daria Bond I** (`zahedan`), with built-in **Linux Mobile Dual-Boot** support on Slot B.
 
 A GitHub Action checks the Volla OTA server every day. When a new stable build appears, it repacks it into a ready-to-flash fastboot package (plus a separate Ubuntu Touch Slot B add-on zip) and publishes it on the [Releases](https://github.com/sajjad85gh/zahedan-vollaos-rom-porter/releases) page.
@@ -25,6 +27,8 @@ A GitHub Action checks the Volla OTA server every day. When a new stable build a
    - **Windows:** right-click `volla-algiz-stable.7z.001` → *7-Zip* → *Extract Here*
    - **Linux/Mac:** `7z x volla-algiz-stable.7z.001`
 
+After extraction, all partition images live inside the **`OS/`** folder, while the flash scripts sit right next to **`OS/`** and **`platform-tools/`**.
+
 ## Flashing guide (VollaOS)
 
 Reboot the phone to the bootloader first: `adb reboot bootloader`, or power off and hold *Volume Down + Power*.
@@ -33,13 +37,10 @@ Reboot the phone to the bootloader first: `adb reboot bootloader`, or power off 
 
 Nothing to install: the latest `platform-tools` is bundled in the `platform-tools` folder.
 
-1. Open the extracted folder (keep the `platform-tools` folder next to the scripts and images).
+1. Open the extracted folder (keep the `OS` and `platform-tools` folders next to the scripts).
 2. Double-click **`flash_all.bat`**.
 3. Type `YES` and press Enter.
-4. Wait until it says **DONE**. The script wipes `frp` (`fastboot erase frp`), sets Slot A active and reboots the phone to recovery by itself.
-
-If something goes wrong, the window **stays open** and shows the error. Don't close it before reading it, and don't reboot into the system.
-If the script waits forever on *"Waiting for a device in fastboot mode..."*, install the Google USB Driver or MediaTek USB driver from Device Manager.
+4. Wait until it says **DONE**. The script wipes `frp`, sets Slot A active, and reboots the phone to recovery by itself.
 
 ### Linux / Mac
 
@@ -52,67 +53,77 @@ If the script waits forever on *"Waiting for a device in fastboot mode..."*, ins
    bash flash_all.sh
    ```
 3. Type `YES` and press Enter.
-4. Wait until it says **Done**. The phone reboots to recovery by itself.
+4. Wait until it says **DONE**. The phone reboots to recovery by itself, and the terminal waits for you to press Enter before closing.
 
 If the phone is not detected on Linux, install `android-udev-rules` (or run with `sudo`).
 
 ### Manual flashing
 
-The exact same commands, in the same (intentional) order, are in `commands.txt`.
+The exact same commands (pointing to `OS/*.img`), in the same intentional order, are in `commands.txt`.
 
 ---
 
 ## Dual-Boot (Linux Mobile on Slot B)
 
-Every release is **dual-boot ready** without touching DariaOS stock `preloader` or `lk` (stock Volla Updater and unsafe Multi-Boot Manager are removed to prevent hard-bricks):
-
-- **Slot A:** VollaOS (includes built-in **Switch to Linux** app + Quick Settings tile)
-- **Slot B:** Linux Mobile — currently **Ubuntu Touch** (and ready for future Sailfish OS / Droidian builds)
-- **`super.img`:** Mirrors `vendor`, `vendor_dlkm`, `odm_dlkm`, and `system_dlkm` to Slot B so Linux Mobile boots natively.
+- **Slot A:** VollaOS (includes built-in **Switch to Linux** app)
+- **Slot B:** Linux Mobile — currently **Ubuntu Touch**
 
 ### 1. One-time GPT partitioning (no custom recovery needed)
 
 > [!CAUTION]
-> Shrinking `userdata` wipes Android data. Back up your files first.
+> Shrinking `userdata` (or removing Linux partitions later) wipes Android data. Back up your files first.
 
-`prepare_gpt.sh` (with its helper `gpt_edit.py`; both are included in the Ubuntu Touch zip and in `flash/`) does the whole job from your PC while Android is running:
-
-- **Requirements:** root (Magisk/KernelSU) granted to the adb shell, USB debugging on, and `adb`, `fastboot` and `python3` on the PC. Nothing but `dd` is used on the phone. On Windows install **Git for Windows** and **Python 3**, then double-click **`prepare_gpt.bat`** (it uses the bundled `platform-tools`; WSL can't see the phone over USB).
-- It finds the disk that holds `userdata` by itself (the disk name differs between devices: on the Daria Bond it is `sdc`, not `sda`), dumps the GPT sectors, **asks how many GiB you want to give Linux** (default 40, minimum about 40, and Android always keeps at least 20 GiB), shrinks `userdata` by that amount and creates `linux_system` (about 9.7 GiB) and `linux_data` (the rest) right after it. Partitions that follow `userdata` (like `flashinfo`) stay where they are. Only the partition entries and CRCs are edited; everything else in the vendor's GPT is left untouched.
+- **Requirements:** root (Magisk/KernelSU) granted to the adb shell, USB debugging on, and `adb`, `fastboot` and `python3` on the PC. On Windows install **Git for Windows** and **Python 3**, then double-click **`prepare_gpt.bat`** (it uses the bundled `platform-tools`; WSL can't see the phone over USB).
+- The script automatically finds the disk that holds `userdata`, **asks how many GiB you want to give Linux** (default 40, minimum about 40), shrinks `userdata` by that amount, and creates `linux_system` (about 9.7 GiB) and `linux_data` (the rest) right after it. Partitions that follow `userdata` (like `flashinfo`) stay where they are. Only the partition entries and CRCs are edited; everything else in the vendor's GPT is left untouched.
 - The result is verified (automatic rollback on any mismatch), then the phone reboots to the bootloader and `userdata`/`metadata` are wiped. The backup and patch files are kept in `gpt_backup_<date>/` on the PC.
 
 ```bash
 bash prepare_gpt.sh
 ```
-Details:
+
+Available options:
+
 ```bash
-bash prepare_gpt.sh                               # interactive: asks how many GiB to give Linux, then asks for YES
+bash prepare_gpt.sh                               # interactive: asks how many GiB to give Linux and asks for confirmation
 bash prepare_gpt.sh --dry-run                     # show the plan only, change nothing
 bash prepare_gpt.sh --linux-gib 64                # non-interactive: 64 GiB in total for Linux
-bash prepare_gpt.sh --restore gpt_backup_<date>   # undo: restore the original table
+bash prepare_gpt.sh --remove --dry-run            # preview removing Linux partitions without changing anything
+bash prepare_gpt.sh --remove                      # return all space to Android
+bash prepare_gpt.sh --restore gpt_backup_<date>   # undo: restore the exact original table from a backup folder
 ```
 
-On Windows run the same options through `prepare_gpt.bat`, e.g. `prepare_gpt.bat --dry-run`.
+On Windows, double-click **`prepare_gpt.bat`** to use the interactive menu (Create / Remove / Restore), or pass the same flags via Command Prompt, e.g. `prepare_gpt.bat --dry-run` or `prepare_gpt.bat --remove --dry-run`.
 
-**Backup:** before changing anything the script asks *"Save the backup? Type YES to save, NO to skip"*. Answer `YES` (the default) to keep the original partition table in a folder named `gpt_backup_<YYYYMMDD>-<HHMMSS>` next to the script. If you answer `NO` the original table can **not** be restored later.
+**Backup:** before changing anything, the script asks *"Save the backup? Type YES to save, NO to skip"*. Answer `YES` (the default) to keep the original partition table in a folder named `gpt_backup_<YYYYMMDD>-<HHMMSS>` next to the script.
 
-**Restoring the backup (undo):** use the exact folder name that was created. For example, a backup made on 27 Nov 2026 at 03:15:42 is in `gpt_backup_20261127-031542`:
+**Returning Linux storage back to Android (removing Dual-Boot):**
 
-```bash
-bash prepare_gpt.sh --restore gpt_backup_20261127-031542
-```
+- **Without a backup (`--remove`):** you can delete `linux_system` and `linux_data` and expand `userdata` back to full size even if you did not save a backup folder. Always preview first with `--dry-run`:
+  ```bash
+  bash prepare_gpt.sh --remove --dry-run
+  bash prepare_gpt.sh --remove
+  ```
+  On Windows:
+  ```bat
+  prepare_gpt.bat --remove --dry-run
+  prepare_gpt.bat --remove
+  ```
+  *(Or double-click `prepare_gpt.bat` and select option `2`.)*
 
-On Windows:
+- **From a saved backup (`--restore`):** use the exact folder name that was created (for example, `gpt_backup_20261127-031542`):
+  ```bash
+  bash prepare_gpt.sh --restore gpt_backup_20261127-031542
+  ```
+  On Windows:
+  ```bat
+  prepare_gpt.bat --restore gpt_backup_20261127-031542
+  ```
 
-```bat
-prepare_gpt.bat --restore gpt_backup_20261127-031542
-```
-
-Type `YES` when asked. The original table is written back, verified, and `userdata`/`metadata` are wiped again (Android data is lost once more). Boot Android afterwards; it formats `userdata` on first start.
+Type `YES` when asked. In both modes, the updated partition table is written and verified, `userdata`/`metadata` are wiped, and the active slot is switched back to **Slot A**. Boot Android afterwards (`fastboot reboot`); it will format `userdata` to full capacity on first start.
 
 ### 2. Flash Ubuntu Touch (Slot B)
 
-1. Download and extract **`volla-algiz-ubuntu-touch-dualboot.zip`** from the same release.
+1. Download and extract **`volla-algiz-ubuntu-touch-dualboot.zip`** (or `.7z.*`) from the Ubuntu Touch release. (Partition images are inside the **`OS/`** folder next to the scripts and `platform-tools/`.)
 2. Run the installer script:
    - **Windows:** double-click **`flash_ut_slot_b.bat`**
    - **Linux/Mac:** run `bash flash_ut_slot_b.sh`
@@ -122,8 +133,8 @@ Type `YES` when asked. The original table is written back, verified, and `userda
 
 ### 3. Switching between VollaOS and Ubuntu Touch
 
-- **VollaOS → Ubuntu Touch:** Tap **Switch to Linux** in the app drawer, or **tap the Quick Settings tile twice** (first tap: *Tap again to confirm*, second tap: switch + reboot; no dialog, so the notification shade is left alone) *(requires root — KernelSU/Magisk)*.
-- **Ubuntu Touch → VollaOS:** Tap **Reboot to Android** in the Lomiri app drawer and confirm *(works out of the box, no setup needed)*.
+- **VollaOS → Ubuntu Touch:** Tap **Switch to Linux** in the app drawer *(requires root — KernelSU/Magisk)*.
+- **Ubuntu Touch → VollaOS:** Tap **Reboot to Android** in the app drawer and confirm.
 - **Without root / Emergency fallback:**
   - **Recovery:** *Reboot → Slot A* (VollaOS) or *Slot B* (Ubuntu Touch)
   - **Fastboot:**

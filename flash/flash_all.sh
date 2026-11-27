@@ -2,17 +2,25 @@
 # VollaOS (Quintus) for Daria Bond I - flash script (Linux / macOS)
 # Run from inside the extracted folder:  bash flash_all.sh
 set -uo pipefail
-cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# If anything fails, keep the terminal open so the error can be read.
+OS_DIR="OS"
+
+# Always keep the terminal open on exit (both success and error) so logs can be read.
 on_exit() {
   local code=$?
-  if [ "$code" -ne 0 ] && [ -t 0 ]; then
-    echo
+  echo
+  if [ "$code" -ne 0 ]; then
     echo "================================================================"
     echo " FLASHING STOPPED (exit code $code). Read the error above."
     echo "================================================================"
-    read -r -p "Press Enter to close..." _
+  else
+    echo "================================================================"
+    echo " DONE. The device is rebooting to recovery."
+    echo "================================================================"
+  fi
+  if [ -z "${NO_PAUSE:-}" ] && { [ -t 0 ] || [ -t 1 ]; } && [ -e /dev/tty ]; then
+    read -r -p "Press Enter to close..." _ </dev/tty 2>/dev/null || true
   fi
 }
 trap on_exit EXIT
@@ -42,19 +50,20 @@ echo
 
 missing=0
 for f in "${REQUIRED_FILES[@]}"; do
-  if [ ! -f "$f" ]; then
-    echo "[ERROR] Missing file: $f"
+  if [ ! -f "$OS_DIR/$f" ]; then
+    echo "[ERROR] Missing file: $OS_DIR/$f"
     missing=1
   fi
 done
 if [ "$missing" -ne 0 ]; then
   echo
-  echo "Some files are missing. Make sure you extracted the whole archive."
+  echo "Some files are missing inside '$OS_DIR/'. Make sure you extracted the whole archive."
   exit 1
 fi
 
 echo "WARNING: This will overwrite your device partitions."
 echo "Make sure the bootloader is unlocked and your important partitions are backed up."
+echo "Note: 'Failed to fetch first 1048576 bytes of super partition' on newer fastboot is harmless."
 read -r -p "Type YES to continue: " answer
 [ "$answer" = "YES" ] || { echo "Aborted."; exit 1; }
 
@@ -76,37 +85,34 @@ run() {
   fi
 }
 
-run flash super super.img
+run flash super "$OS_DIR/super.img"
 
-run flash --slot=all preloader preloader.img
-run flash --slot=all lk lk.img
+run flash --slot=all preloader "$OS_DIR/preloader.img"
+run flash --slot=all lk "$OS_DIR/lk.img"
 
-run flash --slot=all md1img md1img.img
-run flash --slot=all spmfw spmfw.img
-run flash --slot=all pi_img pi_img.img
-run flash --slot=all dpm dpm.img
-run flash --slot=all scp scp.img
-run flash --slot=all sspm sspm.img
-run flash --slot=all mcupm mcupm.img
-run flash --slot=all cam_vpu1 cam_vpu1.img
-run flash --slot=all cam_vpu2 cam_vpu2.img
-run flash --slot=all cam_vpu3 cam_vpu3.img
-run flash --slot=all gz gz.img
-run flash --slot=all tee tee.img
+run flash --slot=all md1img "$OS_DIR/md1img.img"
+run flash --slot=all spmfw "$OS_DIR/spmfw.img"
+run flash --slot=all pi_img "$OS_DIR/pi_img.img"
+run flash --slot=all dpm "$OS_DIR/dpm.img"
+run flash --slot=all scp "$OS_DIR/scp.img"
+run flash --slot=all sspm "$OS_DIR/sspm.img"
+run flash --slot=all mcupm "$OS_DIR/mcupm.img"
+run flash --slot=all cam_vpu1 "$OS_DIR/cam_vpu1.img"
+run flash --slot=all cam_vpu2 "$OS_DIR/cam_vpu2.img"
+run flash --slot=all cam_vpu3 "$OS_DIR/cam_vpu3.img"
+run flash --slot=all gz "$OS_DIR/gz.img"
+run flash --slot=all tee "$OS_DIR/tee.img"
 
-run flash --slot=all boot boot.img
-run flash --slot=all dtbo dtbo.img
-run flash --slot=all init_boot init_boot.img
-run flash --slot=all vendor_boot vendor_boot.img
+run flash --slot=all boot "$OS_DIR/boot.img"
+run flash --slot=all dtbo "$OS_DIR/dtbo.img"
+run flash --slot=all init_boot "$OS_DIR/init_boot.img"
+run flash --slot=all vendor_boot "$OS_DIR/vendor_boot.img"
 
-run flash --slot=all vbmeta vbmeta-disabled.img
-run flash --slot=all vbmeta_system vbmeta-disabled.img
-run flash --slot=all vbmeta_vendor vbmeta-disabled.img
+run flash --slot=all vbmeta "$OS_DIR/vbmeta-disabled.img"
+run flash --slot=all vbmeta_system "$OS_DIR/vbmeta-disabled.img"
+run flash --slot=all vbmeta_vendor "$OS_DIR/vbmeta-disabled.img"
 
 run erase frp
 
 run --set-active=a
 run reboot recovery
-
-echo
-echo "Done. The device is rebooting to recovery."

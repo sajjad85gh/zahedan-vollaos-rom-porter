@@ -6,17 +6,17 @@ on:
   workflow_dispatch:
     inputs:
       build_vollaos:
-        description: 'Build VollaOS ROM'
+        description: 'Check and build VollaOS ROM'
+        required: false
+        default: true
+        type: boolean
+      build_ubuntu_touch:
+        description: 'Check and build Ubuntu Touch dual-boot add-on zip (Slot B)'
         required: false
         default: true
         type: boolean
       force_rebuild:
-        description: 'Force rebuild VollaOS even if version matches last_version.txt'
-        required: false
-        default: false
-        type: boolean
-      build_ubuntu_touch:
-        description: 'Build Ubuntu Touch dual-boot add-on zip (Slot B)'
+        description: 'Force rebuild selected OS(es) even if version matches last_version.txt'
         required: false
         default: false
         type: boolean
@@ -40,13 +40,6 @@ jobs:
       - name: Install Python dependencies
         run: pip install requests==2.32.3 beautifulsoup4==4.12.3
 
-      - name: Install payload-dumper-go
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq liblzma-dev
-          go install github.com/ssut/payload-dumper-go@v0.0.0-20260820001620-05fe59e21c9f
-          echo "$HOME/go/bin" >> "$GITHUB_PATH"
-
       - name: Write OTA checker script
         run: |
           cat << 'PYEOF' > check_ota.py
@@ -62,6 +55,7 @@ jobs:
           DEVICE = "algiz"
           CHANNEL = "stable"
           STATE_FILE = "last_version.txt"
+          STATE_KEY = "VollaOS"
 
           UPDATE_PATTERN = re.compile(
               r'volla-([\d.]+)-(\d{8})-' + re.escape(CHANNEL) + r'-' + re.escape(DEVICE) + r'-signed\.zip',
@@ -127,16 +121,26 @@ jobs:
                       pass
               return parse_html(resp.text)
 
-          def get_last_version():
-              if os.path.exists(STATE_FILE):
-                  with open(STATE_FILE, "r") as f:
-                      return f.read().strip()
-              return ""
+          def get_last_version(key):
+              if not os.path.exists(STATE_FILE):
+                  return ""
+              state = {}
+              with open(STATE_FILE, "r", encoding="utf-8") as f:
+                  for raw in f:
+                      line = raw.strip()
+                      if not line or line.startswith("#"):
+                          continue
+                      if ":" in line:
+                          k, v = line.split(":", 1)
+                          state[k.strip()] = v.strip()
+                      elif "VollaOS" not in state:
+                          state["VollaOS"] = line
+              return state.get(key, "")
 
           def set_output(name, value):
               github_output = os.environ.get("GITHUB_OUTPUT")
               if github_output:
-                  with open(github_output, "a") as f:
+                  with open(github_output, "a", encoding="utf-8") as f:
                       f.write(f"{name}={value}\n")
               else:
                   print(f"::set-output name={name}::{value}")
@@ -154,22 +158,20 @@ jobs:
               print(f"Found {len(updates)} stable update(s). Latest: v{latest_version} ({latest_date})")
 
               force_rebuild = os.environ.get("FORCE_REBUILD", "false").lower() == "true"
-              last_version = get_last_version()
+              last_version = get_last_version(STATE_KEY)
+              print(f"Last recorded {STATE_KEY} version: {last_version or '(none)'}")
               if not force_rebuild and last_version and latest_date <= last_version:
-                  print(f"Already processed version {last_version}. No new update.")
+                  print(f"Already processed {STATE_KEY} version {last_version}. No new update.")
                   set_output("new_update", "false")
                   return 0
 
-              print(f"Building update: {latest_url} (force_rebuild={force_rebuild})")
+              print(f"Building VollaOS update: {latest_url} (force_rebuild={force_rebuild})")
               set_output("new_update", "true")
               set_output("download_url", latest_url)
               set_output("version", latest_version)
               set_output("version_date", latest_date)
               set_output("date_formatted", f"{latest_date[:4]}/{latest_date[4:6]}/{latest_date[6:8]}")
               set_output("android_major", latest_version.split(".")[0])
-
-              with open(STATE_FILE, "w") as f:
-                  f.write(latest_date)
               return 0
 
           if __name__ == "__main__":
@@ -181,6 +183,14 @@ jobs:
         env:
           FORCE_REBUILD: ${{ inputs.force_rebuild || 'false' }}
         run: python check_ota.py
+
+      - name: Install payload-dumper-go
+        if: steps.check.outputs.new_update == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq liblzma-dev
+          go install github.com/ssut/payload-dumper-go@v0.0.0-20260820001620-05fe59e21c9f
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - name: Build dual-boot slot switcher binary (ARM64) & Android APK
         if: steps.check.outputs.new_update == 'true'
@@ -1115,23 +1125,24 @@ jobs:
         if: steps.check.outputs.new_update == 'true'
         run: |
           set -euo pipefail
-          mkdir -p flash_package
+          mkdir -p flash_package/OS
 
           if [ ! -s super.img ]; then
             echo "FATAL: super.img was not built"
             exit 1
           fi
-          cp -f super.img flash_package/super.img
+          cp -f super.img flash_package/OS/super.img
 
-          for img in vbmeta-disabled lk preloader; do
+          for img in vbmeta-disabled lk preloader vendor_boot; do
             if [ ! -s "prebuilt/${img}.img" ]; then
               echo "FATAL: prebuilt/${img}.img is missing from the repository"
               exit 1
             fi
-            cp -f "prebuilt/${img}.img" "flash_package/${img}.img"
+            cp -f "prebuilt/${img}.img" "flash_package/OS/${img}.img"
+            echo "Packed prebuilt/${img}.img -> OS/${img}.img"
           done
 
-          PAYLOAD_PARTS=(md1img spmfw pi_img dpm scp sspm mcupm cam_vpu1 cam_vpu2 cam_vpu3 gz tee boot dtbo init_boot vendor_boot)
+          PAYLOAD_PARTS=(md1img spmfw pi_img dpm scp sspm mcupm cam_vpu1 cam_vpu2 cam_vpu3 gz tee boot dtbo init_boot)
 
           missing=0
           for part in "${PAYLOAD_PARTS[@]}"; do
@@ -1146,8 +1157,8 @@ jobs:
               missing=1
               continue
             fi
-            cp -f "$src" "flash_package/${part}.img"
-            echo "Packed $(basename "$src") -> ${part}.img"
+            cp -f "$src" "flash_package/OS/${part}.img"
+            echo "Packed $(basename "$src") -> OS/${part}.img"
           done
           if [ "$missing" = "1" ]; then
             echo "Extracted files:"
@@ -1159,8 +1170,10 @@ jobs:
           chmod +x flash_package/flash_all.sh
           cp -a platform-tools flash_package/platform-tools
 
-          echo "Flash package contents:"
+          echo "Flash package root contents:"
           ls -lh flash_package/
+          echo "Flash package OS/ contents:"
+          ls -lh flash_package/OS/
 
       - name: Free space - remove extracted partition images
         if: steps.check.outputs.new_update == 'true'
@@ -1193,10 +1206,10 @@ jobs:
           body: |
             ## VollaOS ${{ steps.check.outputs.version }} (${{ steps.check.outputs.date_formatted }}) for Daria Bond (`zahedan`)
 
-            * **Main ROM (`volla-algiz-stable.7z.*`):** VollaOS with DariaOS `preloader`/`lk`, VoLTE & Iran APNs enabled, dual-boot ready `super.img`, stock updater & Multi-Boot removed, and built-in **Switch to Linux** app + Quick Settings tile.
+            * **Main ROM (`volla-algiz-stable.7z.*`):** VollaOS with prebuilt `preloader`/`lk`/`vendor_boot`, VoLTE & Iran APNs enabled, dual-boot ready `super.img`, stock updater & Multi-Boot removed, and built-in **Switch to Linux** app + Quick Settings tile.
             * **Ubuntu Touch Add-on:** Built and released separately under `ubuntu-touch-*` releases.
 
-            See the repository **`README.md`** for full installation, partitioning, and dual-boot instructions.
+            See the repository [**`README.md`**](https://github.com/${{ github.repository }}/blob/main/README.md) ([فارسی](https://github.com/${{ github.repository }}/blob/main/README.fa.md)) for full installation, partitioning, and dual-boot instructions.
           files: |
             volla-algiz-stable.7z.*
         env:
@@ -1279,15 +1292,74 @@ jobs:
 
       - name: Save version state
         if: steps.check.outputs.new_update == 'true'
+        env:
+          STATE_KEY: VollaOS
+          STATE_VALUE: ${{ steps.check.outputs.version_date }}
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add last_version.txt
-          git commit -m "Update last stable version to ${{ steps.check.outputs.version_date }}" || true
-          git push
+
+          BRANCH="${GITHUB_REF_NAME}"
+          for attempt in 1 2 3 4 5; do
+            git fetch origin "$BRANCH"
+            git reset --hard "origin/$BRANCH"
+
+            python3 - << 'PYEOF'
+          import os
+
+          state_file = "last_version.txt"
+          key = os.environ["STATE_KEY"]
+          value = os.environ["STATE_VALUE"]
+
+          entries = {}
+          order = []
+          if os.path.exists(state_file):
+              with open(state_file, "r", encoding="utf-8") as f:
+                  for raw in f:
+                      line = raw.strip()
+                      if not line or line.startswith("#"):
+                          continue
+                      if ":" in line:
+                          k, v = line.split(":", 1)
+                          k, v = k.strip(), v.strip()
+                          if k not in entries:
+                              order.append(k)
+                          entries[k] = v
+                      elif "VollaOS" not in entries:
+                          order.append("VollaOS")
+                          entries["VollaOS"] = line
+
+          if key not in entries:
+              order.append(key)
+          entries[key] = value
+
+          with open(state_file, "w", encoding="utf-8", newline="\n") as f:
+              for k in order:
+                  f.write(f"{k}:{entries[k]}\n")
+          PYEOF
+
+            git add last_version.txt
+            if git diff --cached --quiet; then
+              echo "last_version.txt already up to date (${STATE_KEY}:${STATE_VALUE})."
+              exit 0
+            fi
+
+            git commit -m "Update ${STATE_KEY} last version to ${STATE_VALUE}"
+            if git push origin "HEAD:${BRANCH}"; then
+              echo "Saved ${STATE_KEY}:${STATE_VALUE} to last_version.txt."
+              exit 0
+            fi
+
+            echo "git push failed (attempt ${attempt}/5); retrying..."
+            sleep 3
+          done
+
+          echo "FATAL: Failed to push last_version.txt after 5 attempts."
+          exit 1
 
   build-ubuntu-touch:
-    if: github.event_name == 'workflow_dispatch' && inputs.build_ubuntu_touch == true
+    if: github.event_name == 'schedule' || inputs.build_ubuntu_touch == true
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
@@ -1299,14 +1371,261 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install requests==2.32.3
+        run: pip install requests==2.32.3 beautifulsoup4==4.12.3
+
+      - name: Write Ubuntu Touch OTA checker script
+        run: |
+          cat << 'PYEOF' > check_ut_ota.py
+          #!/usr/bin/env python3
+
+          import os
+          import re
+          import sys
+          from datetime import datetime, timezone
+          from email.utils import parsedate_to_datetime
+          from urllib.parse import urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+
+          ABM_JSON_URL = "https://abm.volla.tech/algiz-a15.json"
+          STATE_FILE = "last_version.txt"
+          STATE_KEY = "UT"
+          HEADERS = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+          }
+
+          DATE_REGEX = re.compile(
+              r'(?<!\d)(20\d{2})[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12]\d|3[01])(?!\d)'
+          )
+          INDEX_DMY_REGEX = re.compile(
+              r'(\d{1,2})-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-(20\d{2})',
+              re.IGNORECASE
+          )
+          INDEX_YMD_REGEX = re.compile(
+              r'(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])'
+          )
+
+          def get_last_version(key):
+              if not os.path.exists(STATE_FILE):
+                  return ""
+              state = {}
+              with open(STATE_FILE, "r", encoding="utf-8") as f:
+                  for raw in f:
+                      line = raw.strip()
+                      if not line or line.startswith("#"):
+                          continue
+                      if ":" in line:
+                          k, v = line.split(":", 1)
+                          state[k.strip()] = v.strip()
+                      elif "VollaOS" not in state:
+                          state["VollaOS"] = line
+              return state.get(key, "")
+
+          def set_output(name, value):
+              github_output = os.environ.get("GITHUB_OUTPUT")
+              if github_output:
+                  with open(github_output, "a", encoding="utf-8") as f:
+                      f.write(f"{name}={value}\n")
+              else:
+                  print(f"::set-output name={name}::{value}")
+
+          def extract_date_from_text(text):
+              if not text:
+                  return None
+              dates = []
+              for m in DATE_REGEX.finditer(str(text)):
+                  candidate = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+                  try:
+                      datetime.strptime(candidate, "%Y%m%d")
+                      dates.append(candidate)
+                  except ValueError:
+                      continue
+              return max(dates) if dates else None
+
+          def parse_http_last_modified(header_val):
+              if not header_val:
+                  return None
+              try:
+                  dt = parsedate_to_datetime(header_val)
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=timezone.utc)
+                  return dt.astimezone(timezone.utc).strftime("%Y%m%d")
+              except (TypeError, ValueError):
+                  return None
+
+          def get_url_last_modified_date(url):
+              try:
+                  resp = requests.head(url, timeout=60, allow_redirects=True, headers=HEADERS)
+                  if resp.ok:
+                      d = parse_http_last_modified(resp.headers.get("Last-Modified"))
+                      if d:
+                          return d
+              except requests.RequestException as e:
+                  print(f"HEAD request failed for {url}: {e}")
+
+              # Fallback: GET with stream=True (reads headers only, closes immediately)
+              resp = None
+              try:
+                  resp = requests.get(url, timeout=60, allow_redirects=True, stream=True, headers=HEADERS)
+                  if resp.ok:
+                      return parse_http_last_modified(resp.headers.get("Last-Modified"))
+              except requests.RequestException as e:
+                  print(f"Stream GET header check failed for {url}: {e}")
+              finally:
+                  if resp is not None:
+                      resp.close()
+              return None
+
+          def get_directory_index_dates(dir_url, cache):
+              if dir_url in cache:
+                  return cache[dir_url]
+              result = {}
+              try:
+                  resp = requests.get(dir_url, timeout=60, headers=HEADERS)
+                  if not resp.ok:
+                      cache[dir_url] = result
+                      return result
+                  soup = BeautifulSoup(resp.text, "html.parser")
+                  text_lines = resp.text.splitlines()
+                  for a_tag in soup.find_all("a", href=True):
+                      href = a_tag["href"]
+                      fname = href.rstrip("/").split("/")[-1]
+                      if not fname or fname in (".", ".."):
+                          continue
+                      # Check sibling text (Nginx/Apache <pre> listing) or table row
+                      row_text = ""
+                      tr = a_tag.find_parent("tr")
+                      if tr is not None:
+                          row_text = tr.get_text(" ", strip=True)
+                      elif a_tag.next_sibling:
+                          row_text = str(a_tag.next_sibling)
+                      if not row_text:
+                          for ln in text_lines:
+                              if fname in ln:
+                                  row_text = ln
+                                  break
+                      d = None
+                      m_ymd = INDEX_YMD_REGEX.search(row_text)
+                      if m_ymd:
+                          d = f"{m_ymd.group(1)}{m_ymd.group(2)}{m_ymd.group(3)}"
+                      else:
+                          m_dmy = INDEX_DMY_REGEX.search(row_text)
+                          if m_dmy:
+                              try:
+                                  dt = datetime.strptime(
+                                      f"{int(m_dmy.group(1)):02d}-{m_dmy.group(2)}-{m_dmy.group(3)}",
+                                      "%d-%b-%Y"
+                                  )
+                                  d = dt.strftime("%Y%m%d")
+                              except ValueError:
+                                  d = None
+                      if d:
+                          result[fname] = d
+              except requests.RequestException as e:
+                  print(f"Directory index fetch failed for {dir_url}: {e}")
+              cache[dir_url] = result
+              return result
+
+          def main():
+              print(f"Checking Volla ABM manifest for latest Ubuntu Touch build: {ABM_JSON_URL}")
+              try:
+                  resp = requests.get(ABM_JSON_URL, timeout=60, headers=HEADERS)
+                  resp.raise_for_status()
+                  data = resp.json()
+              except (requests.RequestException, ValueError) as e:
+                  print(f"Error fetching/parsing {ABM_JSON_URL}: {e}")
+                  set_output("new_update", "false")
+                  return 1
+
+              ut = next((o for o in data.get("oses", []) if o.get("rtype") == "UT"), None)
+              if not ut:
+                  print("FATAL: Ubuntu Touch (rtype=UT) entry not found in algiz-a15.json")
+                  set_output("new_update", "false")
+                  return 1
+
+              inet = {item["id"]: item["url"] for item in ut.get("inet", [])}
+              required_keys = ("ut", "boot", "vendor_boot", "init_boot")
+              for key in required_keys:
+                  if key not in inet:
+                      print(f"FATAL: Missing {key} URL in algiz-a15.json")
+                      set_output("new_update", "false")
+                      return 1
+
+              ut_version = str(ut.get("displayVersion", "unknown")).strip()
+              print(f"Ubuntu Touch displayVersion: {ut_version}")
+
+              detected_dates = []
+              dir_cache = {}
+              for key in required_keys:
+                  url = inet[key]
+                  d = extract_date_from_text(url)
+                  source = "url"
+                  if not d:
+                      d = get_url_last_modified_date(url)
+                      source = "http-last-modified"
+                  if not d:
+                      parsed = urlparse(url)
+                      parent_url = urljoin(url, ".")
+                      fname = parsed.path.rstrip("/").split("/")[-1]
+                      dir_dates = get_directory_index_dates(parent_url, dir_cache)
+                      d = dir_dates.get(fname)
+                      source = "dir-index"
+                  print(f"  [{key}] {url} -> date={d or 'unknown'} (via {source})")
+                  if d:
+                      detected_dates.append(d)
+
+              if not detected_dates:
+                  for field in ("displayVersion", "version", "date", "buildDate", "releaseDate", "updated"):
+                      d = extract_date_from_text(ut.get(field))
+                      if d:
+                          print(f"  [json:{field}] -> date={d}")
+                          detected_dates.append(d)
+
+              if not detected_dates:
+                  print("FATAL: Could not determine Ubuntu Touch build date from URLs, HTTP headers, or manifest.")
+                  set_output("new_update", "false")
+                  return 1
+
+              latest_date = max(detected_dates)
+              print(f"Latest Ubuntu Touch build date: {latest_date} (version: {ut_version})")
+
+              force_rebuild = os.environ.get("FORCE_REBUILD", "false").lower() == "true"
+              last_version = get_last_version(STATE_KEY)
+              print(f"Last recorded {STATE_KEY} version: {last_version or '(none)'}")
+              if not force_rebuild and last_version and latest_date <= last_version:
+                  print(f"Already processed {STATE_KEY} version {last_version}. No new update.")
+                  set_output("new_update", "false")
+                  return 0
+
+              print(f"Building Ubuntu Touch update: {ut_version} ({latest_date}) (force_rebuild={force_rebuild})")
+              set_output("new_update", "true")
+              set_output("ut_version", ut_version)
+              set_output("version_date", latest_date)
+              set_output("date_formatted", f"{latest_date[:4]}/{latest_date[4:6]}/{latest_date[6:8]}")
+              set_output("ut_system_url", inet["ut"])
+              set_output("ut_boot_url", inet["boot"])
+              set_output("ut_vendor_boot_url", inet["vendor_boot"])
+              set_output("ut_init_boot_url", inet["init_boot"])
+              return 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+
+      - name: Check for new Ubuntu Touch update
+        id: check_ut
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild || 'false' }}
+        run: python check_ut_ota.py
 
       - name: Free disk space
+        if: steps.check_ut.outputs.new_update == 'true'
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android
           df -h /
 
       - name: Install Ubuntu Touch build dependencies
+        if: steps.check_ut.outputs.new_update == 'true'
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -1322,6 +1641,7 @@ jobs:
             p7zip-full
 
       - name: Build dual-boot slot switcher binary (ARM64)
+        if: steps.check_ut.outputs.new_update == 'true'
         run: |
           set -euo pipefail
           mkdir -p dualboot_artifacts
@@ -1495,6 +1815,7 @@ jobs:
           ls -lh dualboot_artifacts/switch-slot
 
       - name: Download latest platform-tools (Windows)
+        if: steps.check_ut.outputs.new_update == 'true'
         run: |
           set -euo pipefail
           curl -fL --retry 3 --retry-delay 10 -o platform-tools-windows.zip \
@@ -1508,66 +1829,51 @@ jobs:
           echo "platform-tools contents:"
           ls -lh platform-tools/ | head -n 30
 
+
       - name: Build Ubuntu Touch dual-boot add-on package (Slot B)
         id: ut_dualboot
+        if: steps.check_ut.outputs.new_update == 'true'
+        env:
+          UT_VERSION: ${{ steps.check_ut.outputs.ut_version }}
+          UT_SYSTEM_URL: ${{ steps.check_ut.outputs.ut_system_url }}
+          UT_BOOT_URL: ${{ steps.check_ut.outputs.ut_boot_url }}
+          UT_VENDOR_BOOT_URL: ${{ steps.check_ut.outputs.ut_vendor_boot_url }}
+          UT_INIT_BOOT_URL: ${{ steps.check_ut.outputs.ut_init_boot_url }}
         run: |
           set -euo pipefail
-          mkdir -p ut_dualboot_package
+          mkdir -p ut_dualboot_package/OS
+          echo "UT_VERSION=${UT_VERSION}"
+          echo "UT_SYSTEM_URL=${UT_SYSTEM_URL}"
+          echo "UT_BOOT_URL=${UT_BOOT_URL}"
+          echo "UT_VENDOR_BOOT_URL=${UT_VENDOR_BOOT_URL}"
+          echo "UT_INIT_BOOT_URL=${UT_INIT_BOOT_URL}"
 
-          python3 - << 'PYEOF' > ut_urls.env
-          import requests, sys
+          curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/OS/boot_ut.img "$UT_BOOT_URL"
+          curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/OS/init_boot_ut.img "$UT_INIT_BOOT_URL"
+          curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/OS/vendor_boot_ut.img "$UT_VENDOR_BOOT_URL"
+          curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/OS/system_ut_raw.img "$UT_SYSTEM_URL"
 
-          data = requests.get("https://abm.volla.tech/algiz-a15.json", timeout=60).json()
-          ut = next((o for o in data.get("oses", []) if o.get("rtype") == "UT"), None)
-          if not ut:
-              sys.exit("FATAL: Ubuntu Touch (rtype=UT) entry not found in algiz-a15.json")
-
-          inet = {item["id"]: item["url"] for item in ut.get("inet", [])}
-          for key in ("ut", "boot", "vendor_boot", "init_boot"):
-              if key not in inet:
-                  sys.exit(f"FATAL: Missing {key} URL in algiz-a15.json")
-
-          print(f'UT_VERSION="{ut.get("displayVersion", "unknown")}"')
-          print(f'UT_SYSTEM_URL="{inet["ut"]}"')
-          print(f'UT_BOOT_URL="{inet["boot"]}"')
-          print(f'UT_VENDOR_BOOT_URL="{inet["vendor_boot"]}"')
-          print(f'UT_INIT_BOOT_URL="{inet["init_boot"]}"')
-          PYEOF
-
-          cat ut_urls.env
-          source ut_urls.env
-          echo "ut_version=${UT_VERSION}" >> "$GITHUB_OUTPUT"
-          BUILD_DATE=$(date -u +%Y%m%d)
-          DATE_FORMATTED=$(date -u +%Y/%m/%d)
-          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
-          echo "date_formatted=${DATE_FORMATTED}" >> "$GITHUB_OUTPUT"
-
-          curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/boot_ut.img "$UT_BOOT_URL"
-          curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/init_boot_ut.img "$UT_INIT_BOOT_URL"
-          curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/vendor_boot_ut.img "$UT_VENDOR_BOOT_URL"
-          curl -fL --retry 3 --retry-delay 10 -o ut_dualboot_package/system_ut_raw.img "$UT_SYSTEM_URL"
-
-          if file ut_dualboot_package/system_ut_raw.img | grep -qi 'Android sparse'; then
-            simg2img ut_dualboot_package/system_ut_raw.img ut_dualboot_package/system_ut_unsparse.img
-            mv -f ut_dualboot_package/system_ut_unsparse.img ut_dualboot_package/system_ut_raw.img
+          if file ut_dualboot_package/OS/system_ut_raw.img | grep -qi 'Android sparse'; then
+            simg2img ut_dualboot_package/OS/system_ut_raw.img ut_dualboot_package/OS/system_ut_unsparse.img
+            mv -f ut_dualboot_package/OS/system_ut_unsparse.img ut_dualboot_package/OS/system_ut_raw.img
           fi
 
-          if file ut_dualboot_package/system_ut_raw.img | grep -qi 'ext[234]'; then
+          if file ut_dualboot_package/OS/system_ut_raw.img | grep -qi 'ext[234]'; then
             echo "Injecting one-tap 'Reboot to Android' launcher icon into Ubuntu Touch rootfs..."
-            if dumpe2fs -h ut_dualboot_package/system_ut_raw.img 2>/dev/null | grep -qi 'shared_blocks'; then
-              e2fsck -E unshare_blocks -fy ut_dualboot_package/system_ut_raw.img || true
+            if dumpe2fs -h ut_dualboot_package/OS/system_ut_raw.img 2>/dev/null | grep -qi 'shared_blocks'; then
+              e2fsck -E unshare_blocks -fy ut_dualboot_package/OS/system_ut_raw.img || true
             fi
-            e2fsck -fy ut_dualboot_package/system_ut_raw.img || true
+            e2fsck -fy ut_dualboot_package/OS/system_ut_raw.img || true
 
-            CUR_SZ=$(stat -c%s ut_dualboot_package/system_ut_raw.img)
+            CUR_SZ=$(stat -c%s ut_dualboot_package/OS/system_ut_raw.img)
             MAX_UT_SZ=10368709120
             if [ $((CUR_SZ + 16777216)) -le "$MAX_UT_SZ" ]; then
-              truncate -s +16M ut_dualboot_package/system_ut_raw.img
-              resize2fs ut_dualboot_package/system_ut_raw.img
+              truncate -s +16M ut_dualboot_package/OS/system_ut_raw.img
+              resize2fs ut_dualboot_package/OS/system_ut_raw.img
             fi
 
             mkdir -p ut_mnt
-            sudo mount -o loop,rw ut_dualboot_package/system_ut_raw.img ut_mnt
+            sudo mount -o loop,rw ut_dualboot_package/OS/system_ut_raw.img ut_mnt
 
             sudo install -d -m 0755 -o 0 -g 0 ut_mnt/usr/local/sbin ut_mnt/usr/local/bin ut_mnt/usr/share/applications ut_mnt/usr/share/icons ut_mnt/etc/sudoers.d
             sudo install -m 0755 -o 0 -g 0 dualboot_artifacts/switch-slot ut_mnt/usr/local/sbin/switch-slot
@@ -1673,22 +1979,22 @@ jobs:
             sudo sync
             sudo umount ut_mnt
             rmdir ut_mnt
-            e2fsck -fy ut_dualboot_package/system_ut_raw.img || true
+            e2fsck -fy ut_dualboot_package/OS/system_ut_raw.img || true
             echo "Successfully baked 'Reboot to Android' icon into Ubuntu Touch rootfs."
           else
-            echo "WARNING: system_ut_raw.img is not ext4 ($(file -b ut_dualboot_package/system_ut_raw.img)); skipping rootfs icon injection."
+            echo "WARNING: system_ut_raw.img is not ext4 ($(file -b ut_dualboot_package/OS/system_ut_raw.img)); skipping rootfs icon injection."
           fi
 
           echo "Converting Ubuntu Touch system.img to Android sparse image..."
-          img2simg ut_dualboot_package/system_ut_raw.img ut_dualboot_package/system_ut.img
-          rm -f ut_dualboot_package/system_ut_raw.img
-          ls -lh ut_dualboot_package/
+          img2simg ut_dualboot_package/OS/system_ut_raw.img ut_dualboot_package/OS/system_ut.img
+          rm -f ut_dualboot_package/OS/system_ut_raw.img
+          ls -lh ut_dualboot_package/OS/
 
           python3 - << 'PYEOF'
           import struct
           from pathlib import Path
 
-          p = Path("ut_dualboot_package/vendor_boot_ut.img")
+          p = Path("ut_dualboot_package/OS/vendor_boot_ut.img")
           vb = bytearray(p.read_bytes())
 
           if vb[:8] != b"VNDRBOOT":
@@ -1730,10 +2036,46 @@ jobs:
 
           cat << 'SHEOF' > ut_dualboot_package/flash_ut_slot_b.sh
           #!/usr/bin/env bash
-          set -euo pipefail
-          DIR="$(cd "$(dirname "$0")" && pwd)"
-          FASTBOOT="fastboot"
-          [ -x "$DIR/platform-tools/fastboot" ] && FASTBOOT="$DIR/platform-tools/fastboot"
+          set -uo pipefail
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          cd "$DIR"
+          OS_DIR="OS"
+
+          on_exit() {
+            local code=$?
+            echo
+            if [ "$code" -ne 0 ]; then
+              echo "================================================================"
+              echo " FLASHING STOPPED (exit code $code). Read the error above."
+              echo "================================================================"
+            else
+              echo "================================================================"
+              echo " DONE. Rebooting to recovery (Slot B)."
+              echo "================================================================"
+            fi
+            if [ -z "${NO_PAUSE:-}" ] && { [ -t 0 ] || [ -t 1 ]; } && [ -e /dev/tty ]; then
+              read -r -p "Press Enter to close..." _ </dev/tty 2>/dev/null || true
+            fi
+          }
+          trap on_exit EXIT
+
+          if [ -x "$DIR/platform-tools/fastboot" ]; then
+            FASTBOOT="$DIR/platform-tools/fastboot"
+          elif command -v fastboot >/dev/null 2>&1; then
+            FASTBOOT="$(command -v fastboot)"
+          else
+            echo "[ERROR] fastboot not found."
+            exit 1
+          fi
+
+          missing=0
+          for f in boot_ut.img init_boot_ut.img vendor_boot_ut.img system_ut.img; do
+            if [ ! -f "$OS_DIR/$f" ]; then
+              echo "[ERROR] Missing file: $OS_DIR/$f"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
 
           echo "================================================================"
           echo "  Ubuntu Touch Dual-Boot Installer (Slot B) for Daria Bond"
@@ -1746,71 +2088,144 @@ jobs:
 
           read -r -p "Format 'linux_data'? (Type YES for FIRST install, NO for update): " WIPE_DATA
 
-          "$FASTBOOT" flash boot_b "$DIR/boot_ut.img"
-          "$FASTBOOT" flash init_boot_b "$DIR/init_boot_ut.img"
-          "$FASTBOOT" flash vendor_boot_b "$DIR/vendor_boot_ut.img"
-          "$FASTBOOT" flash linux_system "$DIR/system_ut.img"
+          echo
+          echo "Waiting for a device in fastboot mode..."
+          until "$FASTBOOT" devices 2>/dev/null | grep -q "fastboot"; do
+            sleep 1
+          done
+          echo "Device found."
+
+          run() {
+            echo
+            echo ">> fastboot $*"
+            if ! "$FASTBOOT" "$@"; then
+              echo "[ERROR] 'fastboot $*' failed. Do NOT reboot until resolved."
+              exit 1
+            fi
+          }
+
+          run flash boot_b "$OS_DIR/boot_ut.img"
+          run flash init_boot_b "$OS_DIR/init_boot_ut.img"
+          run flash vendor_boot_b "$OS_DIR/vendor_boot_ut.img"
+          run flash linux_system "$OS_DIR/system_ut.img"
 
           if [ "$WIPE_DATA" = "YES" ]; then
             echo "Erasing linux_data (Halium initrd will auto-format it as ext4 on first boot)..."
-            "$FASTBOOT" erase linux_data
+            run erase linux_data
           fi
 
-          "$FASTBOOT" set_active b
-          echo "Done! Rebooting to recovery (Slot B)..."
-          "$FASTBOOT" reboot recovery
+          run --set-active=b
+          run reboot recovery
           SHEOF
           chmod +x ut_dualboot_package/flash_ut_slot_b.sh
 
           cat << 'BATEOF' > ut_dualboot_package/flash_ut_slot_b.bat
           @echo off
-          setlocal
-          set "DIR=%~dp0"
-          set "FASTBOOT=%DIR%platform-tools\fastboot.exe"
-          if not exist "%FASTBOOT%" set "FASTBOOT=fastboot"
+          setlocal EnableExtensions
 
-          echo ================================================================
-          echo   Ubuntu Touch Dual-Boot Installer (Slot B) for Daria Bond
-          echo   - Keeps VollaOS 16 untouched on Slot A
-          echo   - Includes built-in 'Reboot to Android' one-tap app icon
-          echo   Prerequisite: GPT partitions 'linux_system' ^& 'linux_data' ^(run prepare_gpt.sh first^)
-          echo ================================================================
-          set /p CONFIRM=Type YES to flash Ubuntu Touch to Slot B: 
-          if /I not "%CONFIRM%"=="YES" (
-              echo Aborted.
-              pause
-              exit /b 1
+          if not defined _KEEP_OPEN (
+              set "_KEEP_OPEN=1"
+              start "Ubuntu Touch Dual-Boot Installer (Slot B)" cmd /k call "%~f0" %*
+              exit /b 0
           )
 
-          set /p WIPE_DATA=Format 'linux_data'? (Type YES for FIRST install, NO for update): 
+          cd /d "%~dp0"
+          title Ubuntu Touch Dual-Boot Installer (Slot B)
 
-          "%FASTBOOT%" flash boot_b "%DIR%boot_ut.img" || goto :err
-          "%FASTBOOT%" flash init_boot_b "%DIR%init_boot_ut.img" || goto :err
-          "%FASTBOOT%" flash vendor_boot_b "%DIR%vendor_boot_ut.img" || goto :err
-          "%FASTBOOT%" flash linux_system "%DIR%system_ut.img" || goto :err
+          set "OS_DIR=OS"
+          set "FASTBOOT=%~dp0platform-tools\fastboot.exe"
+          if not exist "%FASTBOOT%" (
+              where fastboot >nul 2>&1
+              if errorlevel 1 (
+                  echo [ERROR] platform-tools\fastboot.exe not found and fastboot is not in PATH.
+                  goto :err
+              )
+              set "FASTBOOT=fastboot"
+          )
+
+          set "MISSING=0"
+          for %%F in (boot_ut.img init_boot_ut.img vendor_boot_ut.img system_ut.img) do (
+              if not exist "%OS_DIR%\%%F" (
+                  echo [ERROR] Missing file: %OS_DIR%\%%F
+                  set "MISSING=1"
+              )
+          )
+          if "%MISSING%"=="1" (
+              echo.
+              echo Some files are missing inside "%OS_DIR%\". Make sure you extracted the whole archive.
+              goto :err
+          )
+
+          echo ================================================================
+          echo   Ubuntu Touch Dual-Boot Installer ^(Slot B^) for Daria Bond
+          echo   - Keeps VollaOS 16 untouched on Slot A
+          echo   - Includes built-in 'Reboot to Android' one-tap app icon
+          echo   Prerequisite: GPT partitions 'linux_system' ^& 'linux_data' ^(run prepare_gpt.bat first^)
+          echo ================================================================
+          set "CONFIRM="
+          set /p "CONFIRM=Type YES to flash Ubuntu Touch to Slot B: "
+          if /I not "%CONFIRM%"=="YES" (
+              echo Aborted.
+              goto :err
+          )
+
+          set "WIPE_DATA="
+          set /p "WIPE_DATA=Format 'linux_data'? (Type YES for FIRST install, NO for update): "
+
+          echo.
+          echo Waiting for a device in fastboot mode...
+          :waitdev
+          "%FASTBOOT%" devices 2>nul | findstr /i "fastboot" >nul
+          if errorlevel 1 (
+              timeout /t 1 /nobreak >nul
+              goto :waitdev
+          )
+          echo Device found.
+
+          call :run flash boot_b "%OS_DIR%\boot_ut.img" || goto :err
+          call :run flash init_boot_b "%OS_DIR%\init_boot_ut.img" || goto :err
+          call :run flash vendor_boot_b "%OS_DIR%\vendor_boot_ut.img" || goto :err
+          call :run flash linux_system "%OS_DIR%\system_ut.img" || goto :err
 
           if /I "%WIPE_DATA%"=="YES" (
               echo Erasing linux_data...
-              "%FASTBOOT%" erase linux_data || goto :err
+              call :run erase linux_data || goto :err
           )
 
-          "%FASTBOOT%" set_active b || goto :err
-          echo DONE! Rebooting to recovery ^(Slot B^)...
-          "%FASTBOOT%" reboot recovery
-          pause
+          call :run --set-active=b || goto :err
+          call :run reboot recovery || goto :err
+
+          echo.
+          echo ================================================================
+          echo  DONE! Rebooting to recovery ^(Slot B^).
+          echo  You can close this window now.
+          echo ================================================================
+          exit /b 0
+
+          :run
+          echo.
+          echo ^>^> fastboot %*
+          "%FASTBOOT%" %*
+          if errorlevel 1 (
+              echo [ERROR] "fastboot %*" failed with exit code %errorlevel%.
+              exit /b 1
+          )
           exit /b 0
 
           :err
           echo.
-          echo ERROR occurred while flashing! Do NOT reboot until resolved.
-          pause
+          echo ================================================================
+          echo  ERROR occurred while flashing! Do NOT reboot until resolved.
+          echo  This window stays open so you can read or copy the text.
+          echo ================================================================
           exit /b 1
           BATEOF
+          python3 -c 'from pathlib import Path; p=Path("ut_dualboot_package/flash_ut_slot_b.bat"); p.write_bytes(p.read_text().replace("\r\n","\n").replace("\n","\r\n").encode())'
 
           cd ut_dualboot_package
           zip -6 -r ../volla-algiz-ubuntu-touch-dualboot.zip .
           cd ..
-          rm -rf ut_dualboot_package ut_urls.env
+          rm -rf ut_dualboot_package
 
           ZIP_SIZE=$(stat -c%s volla-algiz-ubuntu-touch-dualboot.zip)
           echo "Ubuntu Touch dual-boot zip size: $ZIP_SIZE bytes"
@@ -1824,21 +2239,92 @@ jobs:
           ls -lh volla-algiz-ubuntu-touch-dualboot.*
           df -h /
 
+
       - name: Clean up temporary build artifacts
+        if: steps.check_ut.outputs.new_update == 'true'
         run: rm -rf platform-tools dualboot_artifacts
 
       - name: Create GitHub Release (Ubuntu Touch)
+        if: steps.check_ut.outputs.new_update == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ubuntu-touch-${{ steps.ut_dualboot.outputs.build_date }}
-          name: "Ubuntu Touch Dual-Boot ${{ steps.ut_dualboot.outputs.ut_version }} (${{ steps.ut_dualboot.outputs.build_date }})"
+          tag_name: ubuntu-touch-${{ steps.check_ut.outputs.version_date }}
+          name: "Ubuntu Touch Dual-Boot ${{ steps.check_ut.outputs.ut_version }} (${{ steps.check_ut.outputs.version_date }})"
           body: |
-            ## Ubuntu Touch Dual-Boot Add-on (${{ steps.ut_dualboot.outputs.ut_version }} - ${{ steps.ut_dualboot.outputs.date_formatted }}) for Daria Bond (`zahedan`)
+            ## Ubuntu Touch Dual-Boot Add-on (${{ steps.check_ut.outputs.ut_version }} - ${{ steps.check_ut.outputs.date_formatted }}) for Daria Bond (`zahedan`)
 
             * **Slot B Dual-Boot Package (`volla-algiz-ubuntu-touch-dualboot.*`):** Ready-to-flash Ubuntu Touch Slot B package with built-in **Reboot to Android** app icon, patched `vendor_boot`, GPT preparation scripts, and Windows `platform-tools`.
 
-            See the repository **`README.md`** for full installation, partitioning, and dual-boot instructions.
+            See the repository [**`README.md`**](https://github.com/${{ github.repository }}/blob/main/README.md) ([فارسی](https://github.com/${{ github.repository }}/blob/main/README.fa.md)) for full installation, partitioning, and dual-boot instructions.
           files: |
             volla-algiz-ubuntu-touch-dualboot.*
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Save Ubuntu Touch version state
+        if: steps.check_ut.outputs.new_update == 'true'
+        env:
+          STATE_KEY: UT
+          STATE_VALUE: ${{ steps.check_ut.outputs.version_date }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="${GITHUB_REF_NAME}"
+          for attempt in 1 2 3 4 5; do
+            git fetch origin "$BRANCH"
+            git reset --hard "origin/$BRANCH"
+
+            python3 - << 'PYEOF'
+          import os
+
+          state_file = "last_version.txt"
+          key = os.environ["STATE_KEY"]
+          value = os.environ["STATE_VALUE"]
+
+          entries = {}
+          order = []
+          if os.path.exists(state_file):
+              with open(state_file, "r", encoding="utf-8") as f:
+                  for raw in f:
+                      line = raw.strip()
+                      if not line or line.startswith("#"):
+                          continue
+                      if ":" in line:
+                          k, v = line.split(":", 1)
+                          k, v = k.strip(), v.strip()
+                          if k not in entries:
+                              order.append(k)
+                          entries[k] = v
+                      elif "VollaOS" not in entries:
+                          order.append("VollaOS")
+                          entries["VollaOS"] = line
+
+          if key not in entries:
+              order.append(key)
+          entries[key] = value
+
+          with open(state_file, "w", encoding="utf-8", newline="\n") as f:
+              for k in order:
+                  f.write(f"{k}:{entries[k]}\n")
+          PYEOF
+
+            git add last_version.txt
+            if git diff --cached --quiet; then
+              echo "last_version.txt already up to date (${STATE_KEY}:${STATE_VALUE})."
+              exit 0
+            fi
+
+            git commit -m "Update ${STATE_KEY} last version to ${STATE_VALUE}"
+            if git push origin "HEAD:${BRANCH}"; then
+              echo "Saved ${STATE_KEY}:${STATE_VALUE} to last_version.txt."
+              exit 0
+            fi
+
+            echo "git push failed (attempt ${attempt}/5); retrying..."
+            sleep 3
+          done
+
+          echo "FATAL: Failed to push last_version.txt after 5 attempts."
+          exit 1

@@ -1,29 +1,29 @@
-fastboot flash super super.img
+fastboot flash super OS/super.img
 
-fastboot flash --slot=all preloader preloader.img
-fastboot flash --slot=all lk lk.img
+fastboot flash --slot=all preloader OS/preloader.img
+fastboot flash --slot=all lk OS/lk.img
 
-fastboot flash --slot=all md1img md1img.img
-fastboot flash --slot=all spmfw spmfw.img
-fastboot flash --slot=all pi_img pi_img.img
-fastboot flash --slot=all dpm dpm.img
-fastboot flash --slot=all scp scp.img
-fastboot flash --slot=all sspm sspm.img
-fastboot flash --slot=all mcupm mcupm.img
-fastboot flash --slot=all cam_vpu1 cam_vpu1.img
-fastboot flash --slot=all cam_vpu2 cam_vpu2.img
-fastboot flash --slot=all cam_vpu3 cam_vpu3.img
-fastboot flash --slot=all gz gz.img
-fastboot flash --slot=all tee tee.img
+fastboot flash --slot=all md1img OS/md1img.img
+fastboot flash --slot=all spmfw OS/spmfw.img
+fastboot flash --slot=all pi_img OS/pi_img.img
+fastboot flash --slot=all dpm OS/dpm.img
+fastboot flash --slot=all scp OS/scp.img
+fastboot flash --slot=all sspm OS/sspm.img
+fastboot flash --slot=all mcupm OS/mcupm.img
+fastboot flash --slot=all cam_vpu1 OS/cam_vpu1.img
+fastboot flash --slot=all cam_vpu2 OS/cam_vpu2.img
+fastboot flash --slot=all cam_vpu3 OS/cam_vpu3.img
+fastboot flash --slot=all gz OS/gz.img
+fastboot flash --slot=all tee OS/tee.img
 
-fastboot flash --slot=all boot boot.img
-fastboot flash --slot=all dtbo dtbo.img
-fastboot flash --slot=all init_boot init_boot.img
-fastboot flash --slot=all vendor_boot vendor_boot.img
+fastboot flash --slot=all boot OS/boot.img
+fastboot flash --slot=all dtbo OS/dtbo.img
+fastboot flash --slot=all init_boot OS/init_boot.img
+fastboot flash --slot=all vendor_boot OS/vendor_boot.img
 
-fastboot flash --slot=all vbmeta vbmeta-disabled.img
-fastboot flash --slot=all vbmeta_system vbmeta-disabled.img
-fastboot flash --slot=all vbmeta_vendor vbmeta-disabled.img
+fastboot flash --slot=all vbmeta OS/vbmeta-disabled.img
+fastboot flash --slot=all vbmeta_system OS/vbmeta-disabled.img
+fastboot flash --slot=all vbmeta_vendor OS/vbmeta-disabled.img
 
 fastboot erase frp
 

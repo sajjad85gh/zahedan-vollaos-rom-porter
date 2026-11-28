@@ -1133,7 +1133,7 @@ jobs:
           fi
           cp -f super.img flash_package/OS/super.img
 
-          for img in vbmeta-disabled lk preloader vendor_boot; do
+          for img in vbmeta-disabled lk preloader; do
             if [ ! -s "prebuilt/${img}.img" ]; then
               echo "FATAL: prebuilt/${img}.img is missing from the repository"
               exit 1
@@ -1142,7 +1142,7 @@ jobs:
             echo "Packed prebuilt/${img}.img -> OS/${img}.img"
           done
 
-          PAYLOAD_PARTS=(md1img spmfw pi_img dpm scp sspm mcupm cam_vpu1 cam_vpu2 cam_vpu3 gz tee boot dtbo init_boot)
+          PAYLOAD_PARTS=(md1img spmfw pi_img dpm scp sspm mcupm cam_vpu1 cam_vpu2 cam_vpu3 gz tee boot dtbo init_boot vendor_boot)
 
           missing=0
           for part in "${PAYLOAD_PARTS[@]}"; do
@@ -1204,12 +1204,9 @@ jobs:
           tag_name: stable-${{ steps.check.outputs.version_date }}
           name: "Volla Algiz Stable ${{ steps.check.outputs.version_date }}"
           body: |
-            ## VollaOS ${{ steps.check.outputs.version }} (${{ steps.check.outputs.date_formatted }}) for Daria Bond (`zahedan`)
-
-            * **Main ROM (`volla-algiz-stable.7z.*`):** VollaOS with prebuilt `preloader`/`lk`/`vendor_boot`, VoLTE & Iran APNs enabled, dual-boot ready `super.img`, stock updater & Multi-Boot removed, and built-in **Switch to Linux** app + Quick Settings tile.
-            * **Ubuntu Touch Add-on:** Built and released separately under `ubuntu-touch-*` releases.
-
-            See the repository [**`README.md`**](https://github.com/${{ github.repository }}/blob/main/README.md) ([فارسی](https://github.com/${{ github.repository }}/blob/main/README.fa.md)) for full installation, partitioning, and dual-boot instructions.
+            Please read the README:
+            - [README (English)](https://github.com/sajjad85gh/zahedan-vollaos-rom-porter/blob/main/README.md)
+            - [README (فارسی)](https://github.com/sajjad85gh/zahedan-vollaos-rom-porter/blob/main/README.fa.md)
           files: |
             volla-algiz-stable.7z.*
         env:
@@ -2251,11 +2248,9 @@ jobs:
           tag_name: ubuntu-touch-${{ steps.check_ut.outputs.version_date }}
           name: "Ubuntu Touch Dual-Boot ${{ steps.check_ut.outputs.ut_version }} (${{ steps.check_ut.outputs.version_date }})"
           body: |
-            ## Ubuntu Touch Dual-Boot Add-on (${{ steps.check_ut.outputs.ut_version }} - ${{ steps.check_ut.outputs.date_formatted }}) for Daria Bond (`zahedan`)
-
-            * **Slot B Dual-Boot Package (`volla-algiz-ubuntu-touch-dualboot.*`):** Ready-to-flash Ubuntu Touch Slot B package with built-in **Reboot to Android** app icon, patched `vendor_boot`, GPT preparation scripts, and Windows `platform-tools`.
-
-            See the repository [**`README.md`**](https://github.com/${{ github.repository }}/blob/main/README.md) ([فارسی](https://github.com/${{ github.repository }}/blob/main/README.fa.md)) for full installation, partitioning, and dual-boot instructions.
+            Please read the README:
+            - [README (English)](https://github.com/sajjad85gh/zahedan-vollaos-rom-porter/blob/main/README.md)
+            - [README (فارسی)](https://github.com/sajjad85gh/zahedan-vollaos-rom-porter/blob/main/README.fa.md)
           files: |
             volla-algiz-ubuntu-touch-dualboot.*
         env:

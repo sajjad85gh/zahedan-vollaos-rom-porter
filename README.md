@@ -1,10 +1,8 @@
 # VollaOS (Quintus) for Daria Bond I
 
-**English** | [فارسی (Persian)](README.fa.md)
+**English** | [فارسی](README.fa.md)
 
 An unofficial, fully automated port of **Volla OS** to the **Daria Bond I** (`zahedan`), with built-in **Linux Mobile Dual-Boot** support on Slot B.
-
-A GitHub Action checks the Volla OTA server every day. When a new stable build appears, it repacks it into a ready-to-flash fastboot package (plus a separate Ubuntu Touch Slot B add-on zip) and publishes it on the [Releases](https://github.com/sajjad85gh/zahedan-vollaos-rom-porter/releases) page.
 
 > [!WARNING]
 > This ROM is built automatically and is **unofficial**. It can brick your device. Flash at your own risk and back up your important partitions first:
@@ -18,7 +16,7 @@ A GitHub Action checks the Volla OTA server every day. When a new stable build a
 
 - Daria Bond I with an **unlocked bootloader**
 - **7-Zip** on your PC
-- A good USB cable (plug directly into the PC, avoid hubs)
+- A good USB cable
 
 ## Download & extract
 
@@ -53,7 +51,7 @@ Nothing to install: the latest `platform-tools` is bundled in the `platform-tool
    bash flash_all.sh
    ```
 3. Type `YES` and press Enter.
-4. Wait until it says **DONE**. The phone reboots to recovery by itself, and the terminal waits for you to press Enter before closing.
+4. Wait until it says **DONE**.
 
 If the phone is not detected on Linux, install `android-udev-rules` (or run with `sudo`).
 
@@ -68,14 +66,14 @@ The exact same commands (pointing to `OS/*.img`), in the same intentional order,
 - **Slot A:** VollaOS (includes built-in **Switch to Linux** app)
 - **Slot B:** Linux Mobile — currently **Ubuntu Touch**
 
-### 1. One-time GPT partitioning (no custom recovery needed)
+### 1. One-time GPT partitioning
 
 > [!CAUTION]
 > Shrinking `userdata` (or removing Linux partitions later) wipes Android data. Back up your files first.
 
-- **Requirements:** root (Magisk/KernelSU) granted to the adb shell, USB debugging on, and `adb`, `fastboot` and `python3` on the PC. On Windows install **Git for Windows** and **Python 3**, then double-click **`prepare_gpt.bat`** (it uses the bundled `platform-tools`; WSL can't see the phone over USB).
-- The script automatically finds the disk that holds `userdata`, **asks how many GiB you want to give Linux** (default 40, minimum about 40), shrinks `userdata` by that amount, and creates `linux_system` (about 9.7 GiB) and `linux_data` (the rest) right after it. Partitions that follow `userdata` (like `flashinfo`) stay where they are. Only the partition entries and CRCs are edited; everything else in the vendor's GPT is left untouched.
-- The result is verified (automatic rollback on any mismatch), then the phone reboots to the bootloader and `userdata`/`metadata` are wiped. The backup and patch files are kept in `gpt_backup_<date>/` on the PC.
+- **Requirements:** root (Magisk/KernelSU) for `adb root`, USB debugging on, and `python3` on the PC. On Windows install **Git for Windows** and **Python 3**, then run **`prepare_gpt.bat`**.
+- The script automatically finds the disk that holds `userdata`, **asks how many GiB you want to give Linux** (default 40, minimum about 40), shrinks `userdata` by that amount, and creates `linux_system` (about 9.7 GiB) and `linux_data` (the rest) right after it.
+- The backup and patch files are kept in `gpt_backup_<date>/` on the PC.
 
 ```bash
 bash prepare_gpt.sh
@@ -92,7 +90,7 @@ bash prepare_gpt.sh --remove                      # return all space to Android
 bash prepare_gpt.sh --restore gpt_backup_<date>   # undo: restore the exact original table from a backup folder
 ```
 
-On Windows, double-click **`prepare_gpt.bat`** to use the interactive menu (Create / Remove / Restore), or pass the same flags via Command Prompt, e.g. `prepare_gpt.bat --dry-run` or `prepare_gpt.bat --remove --dry-run`.
+On Windows, run **`prepare_gpt.bat`** to use the interactive menu (Create / Remove / Restore), or pass the same flags via Command Prompt, e.g. `prepare_gpt.bat --dry-run` or `prepare_gpt.bat --remove --dry-run`.
 
 **Backup:** before changing anything, the script asks *"Save the backup? Type YES to save, NO to skip"*. Answer `YES` (the default) to keep the original partition table in a folder named `gpt_backup_<YYYYMMDD>-<HHMMSS>` next to the script.
 
@@ -108,7 +106,7 @@ On Windows, double-click **`prepare_gpt.bat`** to use the interactive menu (Crea
   prepare_gpt.bat --remove --dry-run
   prepare_gpt.bat --remove
   ```
-  *(Or double-click `prepare_gpt.bat` and select option `2`.)*
+  *(Or run `prepare_gpt.bat` and select option `2`.)*
 
 - **From a saved backup (`--restore`):** use the exact folder name that was created (for example, `gpt_backup_20261127-031542`):
   ```bash
@@ -125,8 +123,8 @@ Type `YES` when asked. In both modes, the updated partition table is written and
 
 1. Download and extract **`volla-algiz-ubuntu-touch-dualboot.zip`** (or `.7z.*`) from the Ubuntu Touch release. (Partition images are inside the **`OS/`** folder next to the scripts and `platform-tools/`.)
 2. Run the installer script:
-   - **Windows:** double-click **`flash_ut_slot_b.bat`**
-   - **Linux/Mac:** run `bash flash_ut_slot_b.sh`
+   - **Windows:** run **`flash_ut_slot_b.bat`**
+   - **Linux/Mac:** run **`flash_ut_slot_b.sh`**
 3. When asked to format `linux_data`:
    - Type **`YES`** for a **first install** (Halium auto-formats it as `ext4` on first boot).
    - Type **`NO`** when **updating** to keep your Ubuntu Touch data.
@@ -145,4 +143,4 @@ Type `YES` when asked. In both modes, the updated partition table is written and
 
 ### Updating VollaOS with Dual-Boot
 
-Flashing a new VollaOS release (`flash_all`) updates Slot A & B firmware and `super.img`. Afterwards, re-run `flash_ut_slot_b` and answer **`NO`** to *Format 'linux_data'?* to restore Ubuntu Touch on Slot B without losing data. The installer finishes with `fastboot reboot recovery`.
+Flashing a new VollaOS release (`flash_all`) updates Slot A & B firmware and `super.img`. Afterwards, re-run `flash_ut_slot_b` and answer **`NO`** to *Format 'linux_data'?* to restore Ubuntu Touch on Slot B without losing data.
